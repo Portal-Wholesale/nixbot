@@ -43,6 +43,7 @@ let
       private_repo_viewers = cfg.privateRepoViewers;
       eval_max_memory_size = cfg.evalMaxMemorySize;
       eval_worker_count = cfg.evalWorkerCount;
+      eval_concurrency = cfg.evalConcurrency;
       build_concurrency = cfg.buildConcurrency;
       build_store =
         if cfg.buildStore.url == null then
@@ -335,6 +336,15 @@ in
       type = lib.types.nullOr lib.types.int;
       default = null;
       description = "Number of nix-eval-jobs worker processes; null uses the core count.";
+    };
+
+    evalConcurrency = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 1;
+      description = ''
+        Evaluations that may run at once across all repositories. Each runs
+        `evalWorkerCount` workers of up to `evalMaxMemorySize` MiB.
+      '';
     };
 
     showTrace = lib.mkOption {
