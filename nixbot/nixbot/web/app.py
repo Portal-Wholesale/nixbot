@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     from ..auth import AuthzConfig, SessionSigner  # noqa: TID252
     from ..forge_pr import ForgePrClient  # noqa: TID252
     from ..forge_tokens import SessionRevocations  # noqa: TID252
+    from ..machines import MachinesMonitor  # noqa: TID252
     from ..visibility import VisibilityService  # noqa: TID252
     from ..workload_identity import IdentityIssuer  # noqa: TID252
 
@@ -134,6 +135,9 @@ class WebContext:
         self.proxy_auth_header: str | None = None
         # Wired by bootstrap. Effects post PR comments through it.
         self.forge_pr: ForgePrClient | None = None
+        # Wired by bootstrap when a hub status source is configured;
+        # None hides the machines view.
+        self.machines: MachinesMonitor | None = None
 
     async def can_control(self, request: Request, build: dict[str, Any]) -> bool:
         """Whether the requester may restart/cancel this build (drives

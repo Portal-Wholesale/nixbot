@@ -51,6 +51,7 @@ from .gitrepo import (
     RepoManager,
 )
 from .hook_secrets import WebhookSecrets
+from .machines import MachinesMonitor
 from .migrations import apply_migrations
 from .nix_eval import CgroupLimiter, EvalRunner
 from .orchestrator import Orchestrator
@@ -364,6 +365,9 @@ async def build_service(config: Config) -> tuple[CIService, FastAPI]:
         fetcher=BotRepoAccessFetcher(github=github, gitea=gitea, gitlab=gitlab),
         cache=AccessCache(config.repo_acl_cache_ttl),
     )
+    if config.machines is not None:
+        # Polled from run_service; pages read its cache.
+        ctx.machines = MachinesMonitor(config.machines)
 
     providers, oidc_pending = await _login_and_oidc_providers(config)
     if providers or oidc_pending:
@@ -548,9 +552,15 @@ async def run_service(config: Config) -> None:
         poller = PollingService(polled, PollSink(), config.pull_based.poll_spread)
         poller.start()
 
+    machines = app.state.web_context.machines
+    if machines is not None:
+        machines.start()
+
     try:
         await _serve(app, _uvicorn_configs(config, app))
     finally:
+        if machines is not None:
+            await machines.stop()
         if poller is not None:
             await poller.stop()
         for task in tasks:

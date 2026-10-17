@@ -105,6 +105,8 @@ def get_minimal_value_for_field(
     """Generate a minimal valid value for a field from its JSON schema."""
     if field_info.get("format") == "date-time":
         return datetime.now(tz=UTC)
+    if field_info.get("format") == "uri":
+        return "http://test.example/"
 
     if (value := _handle_ref_field(model_class, field_info)) is not None:
         return value

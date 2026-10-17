@@ -16,6 +16,7 @@ from collections.abc import Callable, Mapping  # noqa: TC003
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Literal
+from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
@@ -230,6 +231,28 @@ class BuildStoreConfig(BaseModel):
     credential_env: str = "NIX_GRPC_TOKEN_FILE"
 
 
+class MachinesConfig(BaseModel):
+    """Build machines view, fed by the Tribuchet hub's status snapshot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # The hub's `GET /status` endpoint on its metrics listener, e.g.
+    # http://127.0.0.1:7438/status.
+    status_url: str = Field(json_schema_extra={"format": "uri"})
+    # Workers that should always be connected. A listed worker missing
+    # from the snapshot is down; a connected worker not listed is burst.
+    expected_workers: list[str] = []
+
+    @field_validator("status_url")
+    @classmethod
+    def _http_url(cls, value: str) -> str:
+        parts = urlsplit(value)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            msg = f"status_url must be an http(s) URL, got {value!r}"
+            raise ValueError(msg)
+        return value
+
+
 class PrApprovalConfig(BaseModel):
     """Hold pull requests from outside contributors until a maintainer
     approves them (docs/GITHUB.md). GitHub only: the decision uses the
@@ -382,6 +405,8 @@ class Config(BaseModel):
     # Global cap on concurrent attribute builds; None = derive from CPU count.
     build_concurrency: int | None = None
     build_store: BuildStoreConfig | None = None
+    # Build machines view; None hides it.
+    machines: MachinesConfig | None = None
 
     gitea: GiteaConfig | None = None
     gitlab: GitlabConfig | None = None

@@ -54,6 +54,14 @@ let
             oidc_audience = cfg.buildStore.oidcAudience;
             credential_env = cfg.buildStore.credentialEnv;
           };
+      machines =
+        if cfg.machines.statusUrl == null then
+          null
+        else
+          {
+            status_url = cfg.machines.statusUrl;
+            expected_workers = cfg.machines.expectedWorkers;
+          };
       gitea =
         if !cfg.gitea.enable then
           null
@@ -323,6 +331,31 @@ in
         type = lib.types.str;
         default = "NIX_GRPC_TOKEN_FILE";
         description = "Environment variable that carries the token file path to nix.";
+      };
+    };
+
+    machines = {
+      statusUrl = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "http://127.0.0.1:7438/status";
+        description = ''
+          Tribuchet hub status snapshot (`GET /status` on the hub's
+          metrics listener). When set, nixbot polls it and shows the
+          build machines view; when null, the view is hidden.
+        '';
+      };
+
+      expectedWorkers = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "builder-1" ];
+        description = ''
+          Workers that should always be connected to the hub. A listed
+          worker that is not connected shows as down; a connected
+          worker that is not listed is shown as burst capacity. Only
+          used with {option}`machines.statusUrl`.
+        '';
       };
     };
 
