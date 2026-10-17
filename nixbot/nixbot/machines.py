@@ -15,17 +15,21 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import time
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Collection, Iterable, Mapping
 
     from .config import MachinesConfig
+    from .web.logs import LogRegistry, RunningDrv
+    from .web.queries import WebQueries
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +156,7 @@ class MachinesMonitor:
         self.error_at: float | None = None
         self._departures: dict[str, Departure] = {}
         self._task: asyncio.Task[None] | None = None
+        self.drv_outputs = DrvOutputs()
 
     @property
     def reachable(self) -> bool:
@@ -250,6 +255,31 @@ class MachinesMonitor:
         views.extend(burst[name] for name in sorted(burst))
         return views
 
+    async def worker_builds(
+        self,
+        registry: LogRegistry,
+        queries: WebQueries,
+        *,
+        visible: Collection[int] | None,
+        admin: bool,
+    ) -> dict[str, WorkerBuilds]:
+        """The last snapshot's assignments joined to running Nixbot
+        derivations, filtered for the viewer (see join_builds)."""
+        if self.snapshot is None or not self.snapshot.assignments:
+            return {}
+        running = registry.running_derivations()
+        self.drv_outputs.retain(d.drv_path for d in running)
+        # Unfiltered: join_builds applies visibility and counts the rest.
+        builds = {b["id"]: b for b in await queries.queue()} if running else {}
+        return join_builds(
+            self.snapshot,
+            running,
+            self.drv_outputs,
+            builds,
+            visible=visible,
+            admin=admin,
+        )
+
     async def _run(self) -> None:
         while True:
             try:
@@ -279,3 +309,133 @@ def _describe(error: Exception) -> str:
     if isinstance(error, ValidationError):
         return "invalid status response"
     return str(error) or type(error).__name__
+
+
+# --- joining assignments to running Nixbot derivations -------------------
+
+# Leading outputs list of an ATerm .drv:
+# Derive([("out","/nix/store/…-foo","",""),…],…
+_DRV_OUTPUT = re.compile(r'\("([^"]*)","([^"]*)","[^"]*","[^"]*"\)')
+
+
+def parse_drv_outputs(text: str) -> dict[str, str]:
+    """Output name -> path of a .drv. Outputs without a known path
+    (content-addressed) are left out."""
+    if not text.startswith("Derive(["):
+        msg = "not an ATerm derivation"
+        raise ValueError(msg)
+    outputs = text[len("Derive([") : text.index("],")]
+    return {name: path for name, path in _DRV_OUTPUT.findall(outputs) if path}
+
+
+class DrvOutputs:
+    """Output paths per running drv, read once from the local .drv.
+
+    For input-addressed derivations these are the scratch paths Nix
+    hands Tribuchet, so they match the hub's assignment outputs.
+    """
+
+    def __init__(self) -> None:
+        self._cache: dict[str, dict[str, str]] = {}
+
+    def get(self, drv_path: str) -> dict[str, str]:
+        outputs = self._cache.get(drv_path)
+        if outputs is None:
+            try:
+                outputs = parse_drv_outputs(Path(drv_path).read_text())
+            except (OSError, UnicodeDecodeError, ValueError):
+                logger.warning("cannot read derivation", extra={"drv": drv_path})
+                outputs = {}
+            self._cache[drv_path] = outputs
+        return outputs
+
+    def retain(self, drv_paths: Iterable[str]) -> None:
+        """Forget derivations that are no longer running."""
+        keep = set(drv_paths)
+        self._cache = {d: o for d, o in self._cache.items() if d in keep}
+
+
+@dataclass(frozen=True)
+class BuildRow:
+    """One assignment on a worker. Build fields are None for an
+    assignment shown to an admin by name only."""
+
+    worker: str
+    name: str
+    started_at: int  # hub assignment start, Unix seconds
+    build_id: int | None = None
+    attr: str | None = None
+    drv_path: str | None = None
+    forge: str | None = None
+    owner: str | None = None
+    project_name: str | None = None
+    number: int | None = None
+
+
+@dataclass
+class WorkerBuilds:
+    rows: list[BuildRow] = field(default_factory=list)
+    # Assignments the viewer may not see, or that match no Nixbot build.
+    hidden: int = 0
+
+
+def join_builds(  # noqa: PLR0913
+    snapshot: HubSnapshot,
+    running: Iterable[RunningDrv],
+    outputs: DrvOutputs,
+    builds: Mapping[int, Mapping[str, Any]],
+    *,
+    visible: Collection[int] | None,
+    admin: bool,
+) -> dict[str, WorkerBuilds]:
+    """Per-worker build rows for the viewer.
+
+    An assignment matches a running drv on any output path. Admins also
+    get a match on the derivation name, then a name-only row; other
+    viewers count unmatched assignments, and builds of projects outside
+    `visible` (None = all), as hidden.
+    """
+    by_output: dict[str, RunningDrv] = {}
+    by_name: dict[str, list[RunningDrv]] = {}
+    for drv in running:
+        for path in outputs.get(drv.drv_path).values():
+            by_output[path] = drv
+        by_name.setdefault(drv.name, []).append(drv)
+
+    result: dict[str, WorkerBuilds] = {}
+    for assignment in snapshot.assignments:
+        per_worker = result.setdefault(assignment.worker, WorkerBuilds())
+        match: RunningDrv | None = next(
+            (by_output[p] for p in assignment.outputs.values() if p in by_output),
+            None,
+        )
+        if match is None and admin:
+            named = by_name.get(assignment.name, [])
+            match = named[0] if len(named) == 1 else None
+        build = builds.get(match.build_id) if match is not None else None
+        if match is None or build is None:
+            if admin:
+                per_worker.rows.append(
+                    BuildRow(assignment.worker, assignment.name, assignment.started_at)
+                )
+            else:
+                per_worker.hidden += 1
+            continue
+        if not admin and visible is not None and build["project_id"] not in visible:
+            per_worker.hidden += 1
+            continue
+        per_worker.rows.append(
+            BuildRow(
+                worker=assignment.worker,
+                name=match.name,
+                started_at=assignment.started_at,
+                build_id=match.build_id,
+                attr=match.attr,
+                drv_path=match.drv_path,
+                forge=build["forge"],
+                owner=build["owner"],
+                project_name=build["project_name"],
+                number=build["number"],
+            )
+        )
+    return result

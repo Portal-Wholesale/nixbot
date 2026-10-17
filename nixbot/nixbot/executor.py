@@ -517,6 +517,9 @@ class StructuredCapture:
         # ids. Live ids are ephemeral (the finish reload renumbers).
         self._seen: dict[str, int] = {}
         self._running: set[str] = set()
+        # Build start per drv (ms epoch). The container's t0 waits for
+        # the first log line.
+        self._started: dict[str, int] = {}
         self._pending_cannot: str | None = None
         self._subs: list[asyncio.Queue[dict | None]] = []
         self._closed = False
@@ -590,9 +593,18 @@ class StructuredCapture:
         if drv_path not in self._idx:
             self._idx[drv_path] = len(self._idx)
         self._running.add(drv_path)
+        self._started[drv_path] = self._ts()
         self._emit(
             {"t": "drv", "idx": self._idx[drv_path], "drv": drv_path, "name": name}
         )
+
+    def running(self) -> list[tuple[str, str, int]]:
+        """(drv_path, display name, start ms epoch) of derivations whose
+        builder is running now."""
+        return [
+            (drv, _drv_display_name(drv), self._started[drv])
+            for drv in sorted(self._running)
+        ]
 
     def _bump(self, drv: str) -> int:
         self._seen[drv] = self._seen.get(drv, 0) + 1

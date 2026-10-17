@@ -53,6 +53,14 @@ if TYPE_CHECKING:
     from .app import WebContext
 
 
+class RunningDrv(NamedTuple):
+    build_id: int
+    attr: str
+    drv_path: str
+    name: str
+    t0: int  # ms epoch
+
+
 class LogRegistry:
     """Live LogWriters of currently running attributes."""
 
@@ -69,6 +77,15 @@ class LogRegistry:
 
     def get(self, build_id: int, attr: str) -> LogWriter | None:
         return self._writers.get((build_id, attr))
+
+    def running_derivations(self) -> list[RunningDrv]:
+        """Derivations being built right now, across all attributes."""
+        return [
+            RunningDrv(build_id, attr, drv_path, name, t0)
+            for (build_id, attr), writer in self._writers.items()
+            if writer.capture is not None
+            for drv_path, name, t0 in writer.capture.running()
+        ]
 
     def register_effect(self, run_id: int, writer: LogWriter) -> None:
         self._effects[run_id] = writer

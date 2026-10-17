@@ -1,11 +1,13 @@
-"""Hub status poller: config, departure memory, and classification."""
+"""Hub status poller: config, departure memory, classification, and the
+join of hub assignments to running Nixbot derivations."""
 
 # ruff: noqa: PLR2004 (literal values in test assertions are fine)
 
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -13,12 +15,20 @@ from pydantic import ValidationError
 
 from nixbot.bootstrap import build_service
 from nixbot.config import Config, MachinesConfig
-from nixbot.machines import DEPARTURE_WINDOW, MachinesMonitor, WorkerView
+from nixbot.executor import LogWriter, StructuredCapture
+from nixbot.machines import (
+    DEPARTURE_WINDOW,
+    BuildRow,
+    DrvOutputs,
+    HubSnapshot,
+    MachinesMonitor,
+    WorkerView,
+    join_builds,
+    parse_drv_outputs,
+)
+from nixbot.web.logs import LogRegistry, RunningDrv
 
 from .support import make_config
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 STATUS_URL = "http://127.0.0.1:7438/status"
 NOW = 1_792_215_429
@@ -430,3 +440,246 @@ async def test_start_polls_until_stopped() -> None:
     assert not machines.running
     assert len(hub.requests) >= 2
     assert machines.reachable
+
+
+# --- joining assignments to running derivations --------------------------
+
+PUBLIC, PRIVATE = 1, 2
+BUILDS = {
+    10: {
+        "id": 10,
+        "project_id": PUBLIC,
+        "forge": "github",
+        "owner": "acme",
+        "project_name": "widget",
+        "number": 7,
+    },
+    20: {
+        "id": 20,
+        "project_id": PRIVATE,
+        "forge": "github",
+        "owner": "acme",
+        "project_name": "secret",
+        "number": 3,
+    },
+}
+
+
+def write_drv(tmp_path: Path, name: str, outputs: dict[str, str]) -> str:
+    """A minimal ATerm .drv with the given outputs ("" = CA)."""
+    outs = ",".join(f'("{o}","{p}","","")' for o, p in sorted(outputs.items()))
+    drv = tmp_path / f"0000-{name}.drv"
+    drv.write_text(
+        f'Derive([{outs}],[("/nix/store/x-bash.drv",["out"])],[],'
+        f'"x86_64-linux","/bin/sh",[],[("name","{name}")])'
+    )
+    return str(drv)
+
+
+def assignment(job: str, worker: str, name: str, *outputs: str) -> dict[str, Any]:
+    return {
+        "job_id": job,
+        "worker": worker,
+        "system": "x86_64-linux",
+        "name": name,
+        "outputs": {f"o{i}": p for i, p in enumerate(outputs)},
+        "started_at": NOW - 90,
+    }
+
+
+def two_builds(tmp_path: Path) -> tuple[HubSnapshot, list[RunningDrv]]:
+    """One worker running a public and a private derivation."""
+    public = write_drv(tmp_path, "hello-2.12", {"out": "/nix/store/aaaa-hello-2.12"})
+    private = write_drv(tmp_path, "secret-1.0", {"out": "/nix/store/bbbb-secret-1.0"})
+    snap = HubSnapshot.model_validate(
+        snapshot(
+            worker("netc"),
+            assignments=[
+                assignment("j1", "netc", "hello-2.12", "/nix/store/aaaa-hello-2.12"),
+                assignment("j2", "netc", "secret-1.0", "/nix/store/bbbb-secret-1.0"),
+            ],
+        )
+    )
+    running = [
+        RunningDrv(10, "checks.hello", public, "hello-2.12", NOW * 1000),
+        RunningDrv(20, "checks.secret", private, "secret-1.0", NOW * 1000),
+    ]
+    return snap, running
+
+
+def test_parse_drv_outputs() -> None:
+    text = (
+        'Derive([("dev","/nix/store/b-hello-dev","",""),'
+        '("out","/nix/store/a-hello","","")],[],[],"x86_64-linux","/bin/sh",[],[])'
+    )
+    assert parse_drv_outputs(text) == {
+        "dev": "/nix/store/b-hello-dev",
+        "out": "/nix/store/a-hello",
+    }
+    # Content-addressed outputs have no path yet.
+    ca = 'Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",[],[])'
+    assert parse_drv_outputs(ca) == {}
+    with pytest.raises(ValueError, match="ATerm"):
+        parse_drv_outputs("{}")
+
+
+def test_output_match_yields_build_row(tmp_path: Path) -> None:
+    snap, running = two_builds(tmp_path)
+    result = join_builds(
+        snap, running[:1], DrvOutputs(), BUILDS, visible=None, admin=False
+    )
+    # The second assignment matches no running drv.
+    assert result["netc"].hidden == 1
+    [row] = result["netc"].rows
+    assert row == BuildRow(
+        worker="netc",
+        name="hello-2.12",
+        started_at=NOW - 90,
+        build_id=10,
+        attr="checks.hello",
+        drv_path=running[0].drv_path,
+        forge="github",
+        owner="acme",
+        project_name="widget",
+        number=7,
+    )
+
+
+def test_match_on_any_output(tmp_path: Path) -> None:
+    """Multi-output drvs: Nix may hand over only the outputs it still
+    needs, so one shared path is enough."""
+    drv = write_drv(
+        tmp_path, "lib-1.0", {"out": "/nix/store/c-lib", "dev": "/nix/store/d-lib-dev"}
+    )
+    snap = HubSnapshot.model_validate(
+        snapshot(assignments=[assignment("j", "w", "lib-1.0", "/nix/store/d-lib-dev")])
+    )
+    running = [RunningDrv(10, "lib", drv, "lib-1.0", 0)]
+    result = join_builds(snap, running, DrvOutputs(), BUILDS, visible=None, admin=False)
+    assert [r.attr for r in result["w"].rows] == ["lib"]
+
+
+def test_private_build_hidden_for_non_admin(tmp_path: Path) -> None:
+    """Covers AE4: one public row and "1 build hidden"."""
+    snap, running = two_builds(tmp_path)
+    result = join_builds(
+        snap, running, DrvOutputs(), BUILDS, visible=[PUBLIC], admin=False
+    )
+    assert [r.project_name for r in result["netc"].rows] == ["widget"]
+    assert result["netc"].hidden == 1
+
+
+def test_admin_sees_every_build(tmp_path: Path) -> None:
+    snap, running = two_builds(tmp_path)
+    result = join_builds(snap, running, DrvOutputs(), BUILDS, visible=[], admin=True)
+    assert [r.project_name for r in result["netc"].rows] == ["widget", "secret"]
+    assert result["netc"].hidden == 0
+
+
+def test_unmatched_assignment_hidden_or_named(tmp_path: Path) -> None:
+    """No matching output: hidden for a non-admin, shown by name for
+    an admin (with its build when a running drv has that name)."""
+    drv = write_drv(tmp_path, "ca-thing-1.0", {"out": ""})
+    snap = HubSnapshot.model_validate(
+        snapshot(
+            assignments=[
+                assignment("j1", "w", "ca-thing-1.0", "/nix/store/scratch-1"),
+                assignment("j2", "w", "foreign-2.0", "/nix/store/scratch-2"),
+            ]
+        )
+    )
+    running = [RunningDrv(10, "ca", drv, "ca-thing-1.0", 0)]
+
+    viewer = join_builds(snap, running, DrvOutputs(), BUILDS, visible=None, admin=False)
+    assert viewer["w"].rows == []
+    assert viewer["w"].hidden == 2
+
+    admin = join_builds(snap, running, DrvOutputs(), BUILDS, visible=None, admin=True)
+    by_name = {r.name: r for r in admin["w"].rows}
+    assert by_name["ca-thing-1.0"].number == 7
+    assert by_name["foreign-2.0"].build_id is None
+    assert admin["w"].hidden == 0
+
+
+def test_unreadable_drv_is_skipped(tmp_path: Path) -> None:
+    snap, running = two_builds(tmp_path)
+    missing = running[1]._replace(drv_path=str(tmp_path / "gone.drv"))
+    result = join_builds(
+        snap, [running[0], missing], DrvOutputs(), BUILDS, visible=None, admin=False
+    )
+    assert [r.name for r in result["netc"].rows] == ["hello-2.12"]
+    assert result["netc"].hidden == 1
+
+
+def test_drv_outputs_cached_and_pruned(tmp_path: Path) -> None:
+    drv = write_drv(tmp_path, "x-1", {"out": "/nix/store/x-1"})
+    outputs = DrvOutputs()
+    assert outputs.get(drv) == {"out": "/nix/store/x-1"}
+    Path(drv).unlink()
+    assert outputs.get(drv) == {"out": "/nix/store/x-1"}
+    outputs.retain([])
+    assert outputs.get(drv) == {}
+
+
+def test_registry_lists_running_derivations(tmp_path: Path) -> None:
+    clock = Clock()
+    capture = StructuredCapture(clock=clock)
+    capture.start_build(1, "/nix/store/aaaa-hello-2.12.drv")
+    capture.start_build(2, "/nix/store/bbbb-world-1.0.drv")
+    capture.stop(2)
+    registry = LogRegistry()
+    registry.register(
+        10, "checks.hello", LogWriter(path=tmp_path / "log.zst", capture=capture)
+    )
+    registry.register(11, "plain", LogWriter(path=tmp_path / "plain.zst"))
+    assert registry.running_derivations() == [
+        RunningDrv(
+            10,
+            "checks.hello",
+            "/nix/store/aaaa-hello-2.12.drv",
+            "hello-2.12",
+            NOW * 1000,
+        )
+    ]
+
+
+class FakeQueries:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def queue(self) -> list[dict[str, Any]]:
+        self.calls += 1
+        return list(BUILDS.values())
+
+
+async def test_monitor_worker_builds(tmp_path: Path) -> None:
+    snap, running = two_builds(tmp_path)
+    hub, clock = Hub(), Clock()
+    hub.responses.append(snap.model_dump())
+    machines = monitor(hub, clock)
+
+    class Registry:
+        def running_derivations(self) -> list[RunningDrv]:
+            return running
+
+    queries = FakeQueries()
+    assert (
+        await machines.worker_builds(
+            Registry(),  # type: ignore[arg-type]
+            queries,  # type: ignore[arg-type]
+            visible=None,
+            admin=False,
+        )
+        == {}
+    )
+    assert queries.calls == 0  # no snapshot yet
+
+    await machines.poll_once()
+    result = await machines.worker_builds(
+        Registry(),  # type: ignore[arg-type]
+        queries,  # type: ignore[arg-type]
+        visible=[PUBLIC],
+        admin=False,
+    )
+    assert [r.number for r in result["netc"].rows] == [7]
+    assert result["netc"].hidden == 1
