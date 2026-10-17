@@ -2844,3 +2844,134 @@ def test_machines_hidden_builds(client: WebHarness, tmp_path: Path) -> None:
                 "DELETE FROM projects WHERE name IN ('mach-public', 'mach-private')"
             )
         )
+
+
+# --- worker on running attributes, capacity line -------------------------
+
+
+def start_drv(  # noqa: PLR0913
+    client: WebHarness, tmp_path: Path, build_id: int, attr: str, name: str, out: str
+) -> None:
+    """Register a running derivation of `attr` whose .drv lists `out`."""
+    drv = tmp_path / f"0000-{name}.drv"
+    drv.write_text(
+        f'Derive([("out","{out}","","")],[],[],"x86_64-linux","/bin/sh",[],[])'
+    )
+    writer = client.ctx.log_registry.get(build_id, attr)
+    if writer is None:
+        writer = LogWriter(
+            path=tmp_path / f"{build_id}-{attr}.zst", capture=StructuredCapture()
+        )
+        client.ctx.log_registry.register(build_id, attr, writer)
+    assert writer.capture is not None
+    writer.capture.start_build(len(writer.capture.running()) + 1, str(drv))
+
+
+def hub_assignment(job: str, worker: str, name: str, out: str) -> dict[str, object]:
+    return {
+        "job_id": job,
+        "worker": worker,
+        "system": "x86_64-linux",
+        "name": name,
+        "outputs": {"out": out},
+        "started_at": HUB_NOW,
+    }
+
+
+def test_running_attributes_show_their_workers(
+    client: WebHarness, tmp_path: Path
+) -> None:
+    ctx = client.ctx
+    attrs = ("checks.one", "checks.two", "checks.done")
+
+    async def setup() -> int:
+        project = await insert_project(ctx.pool, "mach-attrs")
+        build_id = await insert_build(
+            ctx.pool, project, number=5, status="building", started=True
+        )
+        await ctx.pool.execute(
+            """
+            INSERT INTO build_attributes (build_id, attr, system, status)
+            VALUES ($1, 'checks.one', 'x86_64-linux', 'building'),
+                   ($1, 'checks.two', 'x86_64-linux', 'building'),
+                   ($1, 'checks.done', 'x86_64-linux', 'succeeded')
+            """,
+            build_id,
+        )
+        return build_id
+
+    build_id = client.run(setup())
+    start_drv(client, tmp_path, build_id, "checks.one", "one-a", "/nix/store/a-one-a")
+    start_drv(client, tmp_path, build_id, "checks.one", "one-b", "/nix/store/b-one-b")
+    start_drv(client, tmp_path, build_id, "checks.two", "two", "/nix/store/c-two")
+    snapshot = {
+        "generated_at": HUB_NOW,
+        "workers": [hub_worker("local-san-dev-framework-1"), hub_worker("netc")],
+        "assignments": [
+            hub_assignment("j1", "netc", "one-a", "/nix/store/a-one-a"),
+            hub_assignment(
+                "j2", "local-san-dev-framework-1", "one-b", "/nix/store/b-one-b"
+            ),
+            hub_assignment(
+                "j3", "local-san-dev-framework-1", "two", "/nix/store/c-two"
+            ),
+        ],
+    }
+    base = "/repos/github/acme/mach-attrs/builds/5"
+    try:
+        # AE5: unconfigured, no worker labels.
+        assert "attr-worker" not in client.get(base).text
+        with machines_on(client, [snapshot]) as machines:
+            client.run(machines.poll_once())
+            for url in (base, f"{base}/attrs?group=building"):
+                rows = {
+                    attr: row
+                    for row in re.findall(
+                        r"<tr data-attr.*?</tr>", client.get(url).text, re.DOTALL
+                    )
+                    for attr in attrs
+                    if f'data-attr="{attr}"' in row
+                }
+                assert "on local-san-dev-framework-1, netc<" in rows["checks.one"], url
+                assert "on local-san-dev-framework-1<" in rows["checks.two"], url
+            done = client.get(f"{base}/attrs?group=succeeded").text
+            assert 'data-attr="checks.done"' in done
+            assert "attr-worker" not in done
+    finally:
+        for attr in attrs:
+            ctx.log_registry.unregister(build_id, attr)
+        client.run(ctx.pool.execute("DELETE FROM projects WHERE name = 'mach-attrs'"))
+
+
+def test_capacity_line(client: WebHarness) -> None:
+    def line(text: str) -> str:
+        match = re.search(r'<p class="capacity">(.*?)</p>', text, re.DOTALL)
+        assert match is not None
+        return " ".join(match.group(1).split())
+
+    # AE5: unconfigured, no capacity line.
+    assert 'class="capacity"' not in client.get("/builds").text
+    snapshot = {
+        "generated_at": HUB_NOW,
+        "queue_depth": 2,
+        "workers": [hub_worker("netc", free_slots=1), hub_worker("i-0abc")],
+    }
+    with machines_on(client, [snapshot, 503], expected=["netc"]) as machines:
+        assert "no build hub data yet" in line(client.get("/builds").text)
+        client.run(machines.poll_once())
+        for url in ("/builds", "/builds/queue"):
+            text = line(client.get(url).text)
+            assert text == (
+                '<a href="/machines">machines</a>: 3/8 slots busy'
+                " · 2 workers up (1 burst) · 2 queued at the hub"
+            ), url
+        client.run(machines.poll_once())
+        assert "(hub unreachable)" in line(client.get("/builds/queue").text)
+
+    # The line stands on its own when Nixbot's queue is empty.
+    capacity = {"busy": 0, "total": 4, "up": 1, "burst_up": 0, "queue_depth": 0}
+    empty = client.ctx.env.get_template("_queue.html").render(
+        queue=[], capacity=capacity
+    )
+    assert "0/4 slots busy" in line(empty)
+    assert "Queue" not in empty

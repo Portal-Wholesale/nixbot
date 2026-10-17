@@ -1447,3 +1447,10 @@ button.quiet:hover {
 .worker-build + .worker-build {
 	margin-top: 0.25rem;
 }
+.attr-worker {
+	margin-left: 0.6em;
+	font-size: 0.85rem;
+}
+.capacity {
+	margin: 0.5rem 0;
+}

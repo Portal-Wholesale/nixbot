@@ -410,6 +410,7 @@ class _PageRoutes:
             request=request,
             queue=await ctx.queries.queue(visible),
             can_cancel_queue=await self._can_cancel_queue(request),
+            capacity=self._capacity(),
             builds=builds[:PAGE_SIZE],
             has_more=len(builds) > PAGE_SIZE,
             more_url="/builds/rows",
@@ -442,6 +443,7 @@ class _PageRoutes:
             request=request,
             queue=await ctx.queries.queue(visible),
             can_cancel_queue=await self._can_cancel_queue(request),
+            capacity=self._capacity(),
         )
 
     async def _can_cancel_queue(self, request: Request) -> bool:
@@ -453,6 +455,39 @@ class _PageRoutes:
         return ctx.authz is not None and is_admin(
             await ctx.request_user(request), ctx.authz
         )
+
+    async def _attr_workers(self, build: dict[str, Any]) -> dict[str, list[str]]:
+        """Workers building each attribute of a running build. Only
+        output matches count: the viewer may already see this build."""
+        ctx = self.ctx
+        if ctx.machines is None or build["status"] != "building":
+            return {}
+        builds = await ctx.machines.worker_builds(
+            ctx.log_registry, ctx.queries, visible=None, admin=False
+        )
+        workers: dict[str, set[str]] = {}
+        for per_worker in builds.values():
+            for row in per_worker.rows:
+                if row.build_id == build["id"] and row.attr is not None:
+                    workers.setdefault(row.attr, set()).add(row.worker)
+        return {attr: sorted(names) for attr, names in workers.items()}
+
+    def _capacity(self) -> dict[str, Any] | None:
+        """The /builds capacity line: slots, workers up, hub queue."""
+        machines = self.ctx.machines
+        if machines is None:
+            return None
+        up = [v for v in machines.roster() if v.session is not None]
+        sessions = [v.session for v in up if v.session is not None]
+        snapshot = machines.snapshot
+        return {
+            "busy": sum(max(s.max_jobs - s.free_slots, 0) for s in sessions),
+            "total": sum(s.max_jobs for s in sessions),
+            "up": len(up),
+            "burst_up": sum(v.kind == "burst" for v in up),
+            "queue_depth": snapshot.queue_depth if snapshot is not None else None,
+            "stale": not machines.reachable,
+        }
 
     async def machines_page(self, request: Request) -> HTMLResponse:
         return await self.ctx.render(
@@ -650,6 +685,7 @@ class _PageRoutes:
             prev_number=prev_number,
             next_number=next_number,
             can_control=await ctx.can_control(request, build),
+            attr_workers=await self._attr_workers(build),
         )
 
     async def effects_page(  # noqa: PLR0913
@@ -764,6 +800,7 @@ class _PageRoutes:
             page=rows.page,
             limit=limit if limit != ATTR_PAGE else None,
             has_next=rows.has_next,
+            attr_workers=await self._attr_workers(build),
         )
 
     async def _grouped_attributes(
@@ -806,6 +843,7 @@ class _PageRoutes:
             warned_counts=warned_counts,
             inline=inline,
             q=q,
+            attr_workers=await self._attr_workers(build),
         )
 
     async def attribute_history(

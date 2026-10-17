@@ -9,6 +9,8 @@
       {% else %}
         <code>{{ a.attr }}</code>
       {% endif %}
+      {% set workers = (attr_workers or {}).get(a.attr) if a.status == "building" %}
+      {% if workers %}<span class="muted attr-worker">on {{ workers | join(", ") }}</span>{% endif %}
       {% if aw %}
         <ul class="attr-warnings">{% for w in aw %}<li>{{ w | ansi }}</li>{% endfor %}</ul>
       {% endif %}

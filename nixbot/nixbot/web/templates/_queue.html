@@ -1,4 +1,17 @@
 {% from "_macros.html" import status_icon, ref_link, ago %}
+{% if capacity %}
+  <p class="capacity">
+    <a href="/machines">machines</a>:
+    {% if capacity.queue_depth is none %}
+      <span class="muted">no build hub data yet</span>
+    {% else %}
+      {{ capacity.busy }}/{{ capacity.total }} slots busy
+      · {{ capacity.up }} worker{{ "s" if capacity.up != 1 }} up ({{ capacity.burst_up }} burst)
+      · {{ capacity.queue_depth }} queued at the hub
+      {% if capacity.stale %}<span class="muted">(hub unreachable)</span>{% endif %}
+    {% endif %}
+  </p>
+{% endif %}
 {% if queue %}
   <div class="section-row">
     <h2 class="section">Queue</h2>
