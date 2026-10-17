@@ -6,6 +6,7 @@ ephemeral Postgres via the httpx ASGI test client."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import re
@@ -15,6 +16,7 @@ from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 import asyncpg
+import httpx
 import pytest
 import zstandard
 from fastapi import Request
@@ -22,8 +24,9 @@ from fastapi.responses import JSONResponse
 from joserfc import jwt
 from joserfc.jwk import KeySet
 
-from nixbot.auth import User
+from nixbot.auth import AuthzConfig, User
 from nixbot.build_scheduler import AttributeStatus
+from nixbot.config import MachinesConfig
 from nixbot.db import BuildStatus
 from nixbot.db_gen import builds as builds_gen
 from nixbot.effects_state import TaskTokens
@@ -35,6 +38,7 @@ from nixbot.executor import (
     effect_run_log_path,
 )
 from nixbot.logstore import LogContainerWriter
+from nixbot.machines import MachinesMonitor
 from nixbot.web import events as events_module
 from nixbot.web import logs as logs_mod
 from nixbot.web.auth_routes import SESSION_COOKIE, create_auth_router
@@ -2636,3 +2640,207 @@ def test_build_eval_stats_surface(client: WebHarness) -> None:
     assert detail["build"]["eval_duration_ms"] == 38400
     row = next(a for a in detail["attributes"] if a["attr"] == "x86_64-linux.evalfail")
     assert (row["eval_wall_ms"], row["eval_alloc_bytes"]) == (412, 50331648)
+
+
+# --- machines page -------------------------------------------------------
+
+HUB_URL = "http://127.0.0.1:7438/status"
+HUB_NOW = 1_792_215_429
+
+
+def hub_worker(name: str, *, free_slots: int = 4) -> dict[str, object]:
+    return {
+        "name": name,
+        "systems": ["x86_64-linux"],
+        "max_jobs": 4,
+        "free_slots": free_slots,
+        "connected_at": HUB_NOW - 3600,
+        "last_heartbeat_at": HUB_NOW,
+    }
+
+
+@contextlib.contextmanager
+def machines_on(
+    client: WebHarness, responses: list[object], expected: list[str] | None = None
+) -> Iterator[MachinesMonitor]:
+    """Enable the machines page with a hub serving `responses` in order
+    (an int is an HTTP status), restoring the shared app afterwards."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        response = responses.pop(0)
+        if isinstance(response, int):
+            return httpx.Response(response)
+        return httpx.Response(200, json=response)
+
+    ctx = client.ctx
+    machines = MachinesMonitor(
+        MachinesConfig(status_url=HUB_URL, expected_workers=expected or []),
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    ctx.set_machines(machines)
+    try:
+        yield machines
+    finally:
+        ctx.machines = None
+        ctx.env.globals.pop("machines_nav", None)
+        ctx.authz = None
+        ctx.visibility = None
+
+
+def test_machines_unconfigured(client: WebHarness) -> None:
+    """Covers AE5: no page and no nav item without a status source."""
+    assert client.get("/machines").status_code == 404
+    assert client.get("/machines/fragment").status_code == 404
+    assert 'href="/machines"' not in client.get("/builds").text
+
+
+def test_machines_nav_on_every_page(client: WebHarness) -> None:
+    with machines_on(client, []):
+        for path in ("/", "/builds", "/repos/github/acme/widget"):
+            assert 'href="/machines"' in client.get(path).text, path
+
+
+def test_machines_page_lists_down_static_worker(client: WebHarness) -> None:
+    """Covers AE2."""
+    snapshot = {
+        "generated_at": HUB_NOW,
+        "queue_depth": 3,
+        "workers": [hub_worker("netc", free_slots=1), hub_worker("i-0abc")],
+    }
+    with machines_on(
+        client, [snapshot], expected=["netc", "local-san-dev-framework-1"]
+    ) as machines:
+        client.run(machines.poll_once())
+        page = client.get("/machines")
+        assert page.status_code == 200
+        assert 'hx-get="/machines/fragment"' in page.text
+        assert 'hx-trigger="every 5s"' in page.text
+        rows = re.findall(r"<tr>(.*?)</tr>", page.text, re.DOTALL)
+        by_worker = {re.findall(r"<td>\s*(\S+)", row)[0]: row for row in rows[1:]}
+        assert list(by_worker) == ["netc", "local-san-dev-framework-1", "i-0abc"]
+        assert 'worker-state down">down<' in by_worker["local-san-dev-framework-1"]
+        assert "<td>static</td>" in by_worker["local-san-dev-framework-1"]
+        assert "3/4" in by_worker["netc"]
+        assert "<td>burst</td>" in by_worker["i-0abc"]
+        assert "3 queued at the hub" in page.text
+        assert "updated" in page.text
+        assert "hub-banner" not in page.text
+
+
+def test_machines_unreachable_keeps_roster(client: WebHarness) -> None:
+    """Covers AE1: after a failed poll the page says so, shows when it
+    last had data, and marks no worker down because of the failure."""
+    snapshot = {"generated_at": HUB_NOW, "workers": [hub_worker("netc")]}
+    with machines_on(client, [snapshot, 503], expected=["netc"]) as machines:
+        client.run(machines.poll_once())
+        client.run(machines.poll_once())
+        page = client.get("/machines").text
+        assert "Build hub unreachable (HTTP 503)" in page
+        assert "Showing the last known state." in page
+        assert "updated <time" in page
+        assert 'class="table-scroll stale"' in page
+        assert 'worker-state up">up<' in page
+        assert "worker-state down" not in page
+
+
+def test_machines_unreachable_before_first_poll(client: WebHarness) -> None:
+    with machines_on(client, [503], expected=["netc"]) as machines:
+        client.run(machines.poll_once())
+        page = client.get("/machines").text
+        assert "No worker data yet." in page
+        assert 'worker-state unknown">unknown<' in page
+        assert "worker-state down" not in page
+
+
+def test_machines_fragment_is_roster_only(client: WebHarness) -> None:
+    snapshot = {"generated_at": HUB_NOW, "workers": [hub_worker("netc")]}
+    with machines_on(client, [snapshot]) as machines:
+        client.run(machines.poll_once())
+        fragment = client.get("/machines/fragment").text
+        assert "<table" in fragment
+        assert "netc" in fragment
+        assert "<html" not in fragment
+        assert "<header" not in fragment
+
+
+def test_machines_hidden_builds(client: WebHarness, tmp_path: Path) -> None:
+    """Covers AE4: a non-admin sees the public build in full and "1 build
+    hidden" for the private one, whose repo name never reaches the HTML.
+    An admin sees both."""
+    ctx = client.ctx
+    drvs = {}
+    for name, out in (("hello-2.12", "aaaa"), ("secret-1.0", "bbbb")):
+        drv = tmp_path / f"0000-{name}.drv"
+        drv.write_text(
+            f'Derive([("out","/nix/store/{out}-{name}","","")],[],[],'
+            '"x86_64-linux","/bin/sh",[],[])'
+        )
+        drvs[name] = str(drv)
+
+    async def setup() -> tuple[int, int, int]:
+        public = await insert_project(ctx.pool, "mach-public")
+        private = await insert_project(ctx.pool, "mach-private", private=True)
+        public_build = await insert_build(
+            ctx.pool, public, number=4, status="building", started=True
+        )
+        private_build = await insert_build(
+            ctx.pool, private, number=9, status="building", started=True
+        )
+        return public, public_build, private_build
+
+    public, public_build, private_build = client.run(setup())
+    for build_id, attr, name in (
+        (public_build, "checks.hello", "hello-2.12"),
+        (private_build, "checks.secret", "secret-1.0"),
+    ):
+        capture = StructuredCapture()
+        capture.start_build(1, drvs[name])
+        ctx.log_registry.register(
+            build_id,
+            attr,
+            LogWriter(path=tmp_path / f"{build_id}.zst", capture=capture),
+        )
+    snapshot = {
+        "generated_at": HUB_NOW,
+        "workers": [hub_worker("netc", free_slots=2)],
+        "assignments": [
+            {
+                "job_id": job,
+                "worker": "netc",
+                "system": "x86_64-linux",
+                "name": name,
+                "outputs": {"out": f"/nix/store/{out}-{name}"},
+                "started_at": HUB_NOW,
+            }
+            for job, name, out in (
+                ("j1", "hello-2.12", "aaaa"),
+                ("j2", "secret-1.0", "bbbb"),
+            )
+        ],
+    }
+    root = User(provider="github", username="root")
+    try:
+        with machines_on(client, [snapshot]) as machines:
+            client.run(machines.poll_once())
+            ctx.authz = AuthzConfig(admins=["github:root"])
+            ctx.visibility = cast("VisibilityService", _StubVisibility([public]))
+            page = client.get("/machines").text
+            assert 'href="/repos/github/acme/mach-public/builds/4"' in page
+            assert "checks.hello" in page
+            assert "hello-2.12" in page
+            assert "1 build hidden" in page
+            assert "mach-private" not in page
+            assert "secret" not in page
+
+            admin = client.get("/machines", user=root).text
+            assert 'href="/repos/github/acme/mach-private/builds/9"' in admin
+            assert 'href="/repos/github/acme/mach-public/builds/4"' in admin
+            assert "build hidden" not in admin
+    finally:
+        ctx.log_registry.unregister(public_build, "checks.hello")
+        ctx.log_registry.unregister(private_build, "checks.secret")
+        client.run(
+            ctx.pool.execute(
+                "DELETE FROM projects WHERE name IN ('mach-public', 'mach-private')"
+            )
+        )

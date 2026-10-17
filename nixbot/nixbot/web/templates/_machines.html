@@ -1,0 +1,75 @@
+{% from "_macros.html" import ago %}
+<div class="section-row">
+  <h2 class="section">Machines</h2>
+  <span class="muted">
+    {% if m.fetched_at %}updated {{ ago(m.fetched_at) }}{% endif %}
+    {% if m.queue_depth is not none %}· {{ m.queue_depth }} queued at the hub{% endif %}
+  </span>
+</div>
+{% if m.error %}
+  <p class="hub-banner" role="status">
+    Build hub unreachable ({{ m.error }}) since {{ ago(m.error_at) }}.
+    {% if m.fetched_at %}
+      Showing the last known state.
+    {% else %}
+      No worker data yet.
+    {% endif %}
+  </p>
+{% endif %}
+<div class="table-scroll{% if m.stale %} stale{% endif %}">
+  <table class="builds machines">
+    <caption class="visually-hidden">build workers</caption>
+    <tr>
+      <th scope="col">worker</th>
+      <th scope="col">class</th>
+      <th scope="col">state</th>
+      <th scope="col">slots</th>
+      <th scope="col">builds</th>
+    </tr>
+    {% for w in m.workers %}
+      <tr>
+        <td>
+          {{ w.name }}
+          {% if w.systems %}<div class="muted">{{ w.systems | join(", ") }}</div>{% endif %}
+        </td>
+        <td>{{ w.kind }}</td>
+        <td>
+          <span class="worker-state {{ w.state }}">{{ "recently departed" if w.state == "departed" else w.state }}</span>
+          {% if w.connected_at %}
+            <div class="muted">since {{ ago(w.connected_at) }}</div>
+          {% elif w.departed_at %}
+            <div class="muted">left {{ ago(w.departed_at) }}</div>
+          {% endif %}
+        </td>
+        <td>
+          {% if w.state == "up" %}
+            {{ w.used }}/{{ w.total }}
+          {% else %}
+            –
+          {% endif %}
+        </td>
+        <td>
+          {% for b in w.builds %}
+            <div class="worker-build">
+              {% if b.href %}
+                <a href="{{ b.href }}">{{ b.label }}</a>
+                <span class="muted">{{ b.attr }}</span>
+              {% endif %}
+              <code>{{ b.drv_name }}</code>
+              <span class="muted">{{ b.elapsed | duration_secs }}</span>
+            </div>
+          {% endfor %}
+          {% if w.hidden %}
+            <div class="muted">{{ w.hidden }} build{{ "s" if w.hidden != 1 }} hidden</div>
+          {% elif w.state == "up" and not w.builds %}
+            <span class="muted">idle</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% else %}
+      <tr>
+        <td colspan="5" class="muted">No build workers.</td>
+      </tr>
+    {% endfor %}
+  </table>
+</div>

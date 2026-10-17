@@ -15,7 +15,9 @@ Visibility filtering hooks (`visible_repo_ids`) are wired by task
 from __future__ import annotations
 
 import json
+import time
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
@@ -61,7 +63,14 @@ from .queries import PAGE_SIZE, BuildFilters, WebQueries
 from .routing import register_owner_convertor
 from .state_routes import create_state_router
 from .task_routes import create_task_router
-from .templating import STATIC_DIR, CachedStaticFiles, make_env, repo_path
+from .templating import (
+    STATIC_DIR,
+    CachedStaticFiles,
+    build_path,
+    make_env,
+    repo_name,
+    repo_path,
+)
 from .workload_routes import create_workload_identity_router
 
 if TYPE_CHECKING:
@@ -69,7 +78,7 @@ if TYPE_CHECKING:
     from ..auth import AuthzConfig, SessionSigner  # noqa: TID252
     from ..forge_pr import ForgePrClient  # noqa: TID252
     from ..forge_tokens import SessionRevocations  # noqa: TID252
-    from ..machines import MachinesMonitor  # noqa: TID252
+    from ..machines import BuildRow, MachinesMonitor, WorkerBuilds  # noqa: TID252
     from ..visibility import VisibilityService  # noqa: TID252
     from ..workload_identity import IdentityIssuer  # noqa: TID252
 
@@ -138,6 +147,13 @@ class WebContext:
         # Wired by bootstrap when a hub status source is configured;
         # None hides the machines view.
         self.machines: MachinesMonitor | None = None
+        # Running builds, for joining hub assignments. Set by create_app.
+        self.log_registry = LogRegistry()
+
+    def set_machines(self, machines: MachinesMonitor) -> None:
+        """Enable the machines page and its nav item."""
+        self.machines = machines
+        self.env.globals["machines_nav"] = True
 
     async def can_control(self, request: Request, build: dict[str, Any]) -> bool:
         """Whether the requester may restart/cancel this build (drives
@@ -291,6 +307,70 @@ def create_legacy_router(ctx: WebContext) -> APIRouter:
     return router
 
 
+def _at(ts: float | None) -> datetime | None:
+    return datetime.fromtimestamp(ts, tz=UTC) if ts is not None else None
+
+
+def _machine_build(row: BuildRow, now: float) -> dict[str, Any]:
+    """A build row's link and labels. Kept explicit: the row's `name` is
+    the derivation's, which build_path would take for the repo's."""
+    build: dict[str, Any] = {
+        "drv_name": row.name,
+        "attr": row.attr,
+        "elapsed": now - row.started_at,
+        "href": None,
+        "label": None,
+    }
+    if row.number is not None and row.owner is not None:
+        project = {
+            "forge": row.forge,
+            "owner": row.owner,
+            "project_name": row.project_name,
+        }
+        build["href"] = build_path(project, row.number)
+        build["label"] = f"{repo_name(row.owner, row.project_name or '')} #{row.number}"
+    return build
+
+
+def _machines_view(
+    machines: MachinesMonitor, builds: dict[str, WorkerBuilds], now: float
+) -> dict[str, Any]:
+    """Template context for the machines page: the roster with each up
+    worker's slots and build rows, and the poller's freshness."""
+    workers = []
+    for view in machines.roster():
+        session = view.session
+        per_worker = builds.get(view.name) if session is not None else None
+        workers.append(
+            {
+                "name": view.name,
+                "kind": view.kind,
+                "state": view.state,
+                "systems": session.systems if session is not None else [],
+                "total": session.max_jobs if session is not None else 0,
+                "used": session.max_jobs - session.free_slots
+                if session is not None
+                else 0,
+                "connected_at": _at(session.connected_at if session else None),
+                "departed_at": _at(view.departed_at),
+                "builds": [
+                    _machine_build(row, now)
+                    for row in (per_worker.rows if per_worker else [])
+                ],
+                "hidden": per_worker.hidden if per_worker else 0,
+            }
+        )
+    snapshot = machines.snapshot
+    return {
+        "workers": workers,
+        "queue_depth": snapshot.queue_depth if snapshot is not None else None,
+        "fetched_at": _at(machines.fetched_at),
+        "error": machines.error,
+        "error_at": _at(machines.error_at),
+        "stale": not machines.reachable,
+    }
+
+
 class _PageRoutes:
     def __init__(self, ctx: WebContext) -> None:
         self.ctx = ctx
@@ -366,10 +446,36 @@ class _PageRoutes:
 
     async def _can_cancel_queue(self, request: Request) -> bool:
         """UX only. The cancel-all route re-checks server-side."""
+        return await self._is_admin(request)
+
+    async def _is_admin(self, request: Request) -> bool:
         ctx = self.ctx
         return ctx.authz is not None and is_admin(
             await ctx.request_user(request), ctx.authz
         )
+
+    async def machines_page(self, request: Request) -> HTMLResponse:
+        return await self.ctx.render(
+            "machines.html", request=request, m=await self._machines(request)
+        )
+
+    async def machines_fragment(self, request: Request) -> HTMLResponse:
+        return await self.ctx.render(
+            "_machines.html", request=request, m=await self._machines(request)
+        )
+
+    async def _machines(self, request: Request) -> dict[str, Any]:
+        ctx = self.ctx
+        if ctx.machines is None:
+            raise HTTPException(status_code=404)
+        admin = await self._is_admin(request)
+        builds = await ctx.machines.worker_builds(
+            ctx.log_registry,
+            ctx.queries,
+            visible=None if admin else await ctx.visible_repo_ids(request),
+            admin=admin,
+        )
+        return _machines_view(ctx.machines, builds, time.time())
 
     async def _schedules(self, project_id: int) -> list[Any]:
         store = ScheduledEffectsStore(self.ctx.pool)
@@ -795,6 +901,8 @@ def create_router(ctx: WebContext) -> APIRouter:
         ("/builds", pages.activity),
         ("/builds/rows", pages.activity_rows),
         ("/builds/queue", pages.queue_fragment),
+        ("/machines", pages.machines_page),
+        ("/machines/fragment", pages.machines_fragment),
         ("/repos/{forge}/{owner:owner}/{name:segment}", pages.repo_page),
         ("/repos/{forge}/{owner:owner}/{name:segment}/rows", pages.repo_rows),
         (
@@ -933,6 +1041,7 @@ def create_app(
     app.include_router(create_router(ctx), include_in_schema=False)
     registry = log_registry or LogRegistry()
     app.state.log_registry = registry
+    ctx.log_registry = registry
     app.include_router(create_log_router(ctx, registry), include_in_schema=False)
     app.include_router(create_log_api_router(ctx, registry))
     app.include_router(create_metrics_router(pool), include_in_schema=False)

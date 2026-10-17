@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}
+  machines
+{% endblock title %}
+{% block body %}
+  <main id="main">
+    <section class="content">
+      {# Hub-only changes emit no build events, so poll like the hub poller. #}
+      <div hx-get="/machines/fragment"
+           hx-trigger="every 5s"
+           hx-swap="innerMorph">{% include "_machines.html" %}</div>
+    </section>
+  </main>
+{% endblock body %}

@@ -367,7 +367,7 @@ async def build_service(config: Config) -> tuple[CIService, FastAPI]:
     )
     if config.machines is not None:
         # Polled from run_service; pages read its cache.
-        ctx.machines = MachinesMonitor(config.machines)
+        ctx.set_machines(MachinesMonitor(config.machines))
 
     providers, oidc_pending = await _login_and_oidc_providers(config)
     if providers or oidc_pending:

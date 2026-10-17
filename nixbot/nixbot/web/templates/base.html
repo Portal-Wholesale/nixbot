@@ -25,6 +25,7 @@
         <a href="/">nixbot</a>
       </h1>
       <a href="/builds">builds</a>
+      {% if machines_nav %}<a href="/machines">machines</a>{% endif %}
       <span class="header-spacer"></span>
       {% if user or login_providers %}
         <details class="menu">

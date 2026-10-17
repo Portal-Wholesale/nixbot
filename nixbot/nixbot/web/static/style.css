@@ -1420,3 +1420,30 @@ button.quiet:hover {
 	border-color: var(--border);
 	color: var(--fg);
 }
+/* Machines page. A failed hub poll dims the last known roster rather
+   than marking workers down. */
+.hub-banner {
+	background: var(--card);
+	border-left: 4px solid var(--warn);
+	padding: 0.5rem 0.8rem;
+}
+.stale {
+	opacity: 0.55;
+}
+.worker-state {
+	font-weight: 600;
+	white-space: nowrap;
+}
+.worker-state.up {
+	color: var(--ok);
+}
+.worker-state.down {
+	color: var(--bad);
+}
+.worker-state.departed,
+.worker-state.unknown {
+	color: var(--muted);
+}
+.worker-build + .worker-build {
+	margin-top: 0.25rem;
+}
