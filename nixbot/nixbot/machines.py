@@ -87,6 +87,15 @@ class HubSnapshot(_HubModel):
     queued: list[HubQueued] = []
     departed: list[HubDeparted] = []
 
+    def running_by_worker(self) -> dict[str, int]:
+        """Builds the hub has dispatched to each worker name. A worker's
+        `free_slots` counts a lookahead build on top of its real free
+        slots, so `max_jobs - free_slots` reads -1 on an idle worker."""
+        running: dict[str, int] = {}
+        for assignment in self.assignments:
+            running[assignment.worker] = running.get(assignment.worker, 0) + 1
+        return running
+
     def sessions_by_name(self) -> dict[str, HubWorker]:
         """One session per worker name. During an overlapping reconnect
         the hub briefly lists the same name twice; the newest session

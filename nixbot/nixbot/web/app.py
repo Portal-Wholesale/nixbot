@@ -337,6 +337,8 @@ def _machines_view(
 ) -> dict[str, Any]:
     """Template context for the machines page: the roster with each up
     worker's slots and build rows, and the poller's freshness."""
+    snapshot = machines.snapshot
+    running = snapshot.running_by_worker() if snapshot is not None else {}
     workers = []
     for view in machines.roster():
         session = view.session
@@ -348,9 +350,7 @@ def _machines_view(
                 "state": view.state,
                 "systems": session.systems if session is not None else [],
                 "total": session.max_jobs if session is not None else 0,
-                "used": session.max_jobs - session.free_slots
-                if session is not None
-                else 0,
+                "used": running.get(view.name, 0) if session is not None else 0,
                 "connected_at": _at(session.connected_at if session else None),
                 "departed_at": _at(view.departed_at),
                 "builds": [
@@ -360,7 +360,6 @@ def _machines_view(
                 "hidden": per_worker.hidden if per_worker else 0,
             }
         )
-    snapshot = machines.snapshot
     return {
         "workers": workers,
         "queue_depth": snapshot.queue_depth if snapshot is not None else None,
@@ -480,8 +479,9 @@ class _PageRoutes:
         up = [v for v in machines.roster() if v.session is not None]
         sessions = [v.session for v in up if v.session is not None]
         snapshot = machines.snapshot
+        running = snapshot.running_by_worker() if snapshot is not None else {}
         return {
-            "busy": sum(max(s.max_jobs - s.free_slots, 0) for s in sessions),
+            "busy": sum(running.get(v.name, 0) for v in up),
             "total": sum(s.max_jobs for s in sessions),
             "up": len(up),
             "burst_up": sum(v.kind == "burst" for v in up),

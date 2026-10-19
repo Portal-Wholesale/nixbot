@@ -2659,6 +2659,18 @@ def hub_worker(name: str, *, free_slots: int = 4) -> dict[str, object]:
     }
 
 
+def hub_assignments(worker: str, count: int) -> list[dict[str, object]]:
+    return [
+        {
+            "job_id": f"{worker}-{n}",
+            "worker": worker,
+            "system": "x86_64-linux",
+            "started_at": HUB_NOW,
+        }
+        for n in range(count)
+    ]
+
+
 @contextlib.contextmanager
 def machines_on(
     client: WebHarness, responses: list[object], expected: list[str] | None = None
@@ -2705,7 +2717,11 @@ def test_machines_page_lists_down_static_worker(client: WebHarness) -> None:
     snapshot = {
         "generated_at": HUB_NOW,
         "queue_depth": 3,
-        "workers": [hub_worker("netc", free_slots=1), hub_worker("i-0abc")],
+        "workers": [
+            hub_worker("netc", free_slots=2),
+            hub_worker("i-0abc", free_slots=5),
+        ],
+        "assignments": hub_assignments("netc", 3),
     }
     with machines_on(
         client, [snapshot], expected=["netc", "local-san-dev-framework-1"]
@@ -2721,6 +2737,9 @@ def test_machines_page_lists_down_static_worker(client: WebHarness) -> None:
         assert 'worker-state down">down<' in by_worker["local-san-dev-framework-1"]
         assert "<td>static</td>" in by_worker["local-san-dev-framework-1"]
         assert "3/4" in by_worker["netc"]
+        # Slots come from assignments: an idle worker's declared
+        # lookahead slot must not read as -1 busy.
+        assert "0/4" in by_worker["i-0abc"]
         assert "<td>burst</td>" in by_worker["i-0abc"]
         assert "3 queued at the hub" in page.text
         assert "updated" in page.text
@@ -2954,7 +2973,11 @@ def test_capacity_line(client: WebHarness) -> None:
     snapshot = {
         "generated_at": HUB_NOW,
         "queue_depth": 2,
-        "workers": [hub_worker("netc", free_slots=1), hub_worker("i-0abc")],
+        "workers": [
+            hub_worker("netc", free_slots=2),
+            hub_worker("i-0abc", free_slots=5),
+        ],
+        "assignments": hub_assignments("netc", 3),
     }
     with machines_on(client, [snapshot, 503], expected=["netc"]) as machines:
         assert "no build hub data yet" in line(client.get("/builds").text)
