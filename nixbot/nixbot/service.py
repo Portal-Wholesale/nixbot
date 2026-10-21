@@ -51,6 +51,7 @@ from .recovery import (
 from .repos import repo_info
 from .schedules import DueEffect, ScheduledEffectsStore
 from .webhooks import (
+    BranchDeleted,
     ChangeRequest,
     CheckRerequested,
     PrApproved,
@@ -251,6 +252,8 @@ class CIService:
     async def submit(self, event: WebhookEvent) -> None:
         if isinstance(event, PrClosed):
             await self._submit_pr_closed(event)
+        elif isinstance(event, BranchDeleted):
+            await self._submit_branch_deleted(event)
         elif isinstance(event, PrComment):
             await self._deliver_for_pr(
                 event, "comment", command=event.command, args=event.args
@@ -288,6 +291,18 @@ class CIService:
                 pr_number=event.pr_number,
             )
         await self._deliver_for_pr(event, "pull_request_closed")
+
+    async def _submit_branch_deleted(self, event: BranchDeleted) -> None:
+        project = await self.repo_store.by_forge_id(event.forge, event.forge_repo_id)
+        if project is not None:
+            self.orchestrator.canceller.cancel_branch(project.id_, event.branch)
+        # Queued pushes of the branch would build it after the delete.
+        await q.supersede_pending_branch_changes(
+            self.pool,
+            forge=event.forge,
+            forge_repo_id=event.forge_repo_id,
+            branch=event.branch,
+        )
 
     async def _deliver_for_pr(
         self,

@@ -200,6 +200,17 @@ WHERE kind = 'change' AND status = 'pending'
   AND payload->>'forge_repo_id' = sqlc.arg(forge_repo_id)::text
   AND (payload->>'pr_number')::int = sqlc.arg(pr_number)::int;
 
+-- name: SupersedePendingBranchChanges :exec
+-- A deleted branch's queued pushes. PR changes carry the base branch
+-- in `branch`, and tags their own name, so both are left alone.
+UPDATE work_queue SET status = 'done', finished_at = now()
+WHERE kind = 'change' AND status = 'pending'
+  AND payload->>'forge' = sqlc.arg(forge)::text
+  AND payload->>'forge_repo_id' = sqlc.arg(forge_repo_id)::text
+  AND payload->>'pr_number' IS NULL
+  AND payload->>'tag' IS NULL
+  AND payload->>'branch' = sqlc.arg(branch)::text;
+
 -- name: CancelAttribute :execrows
 UPDATE build_attributes SET status = 'cancelled', finished_at = now()
 WHERE build_id = $1 AND attr = $2 AND status IN ('pending', 'building');

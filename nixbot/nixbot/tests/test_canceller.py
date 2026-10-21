@@ -132,6 +132,17 @@ def test_pr_close_cancels() -> None:
     assert not mgr.cancel_pr(1, 1234)
 
 
+def test_branch_delete_cancels() -> None:
+    mgr = CancellationManager()
+    _, event = reg(mgr, 1, "tree1", "sha1", context=branch_key("mergify/merge-queue/a"))
+    _, pr_event = reg(mgr, 2, "tree2", "sha2", context="pr/7")
+    assert mgr.cancel_branch(1, "mergify/merge-queue/a")
+    assert event.is_set()
+    # Only that branch's build: a PR is not a branch of the same name.
+    assert not mgr.cancel_branch(1, "pr/7")
+    assert not pr_event.is_set()
+
+
 def test_completed_build_not_cancelled_later() -> None:
     mgr = CancellationManager()
     _, event = reg(mgr, 1, "tree1", "sha1")

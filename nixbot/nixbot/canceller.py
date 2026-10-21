@@ -12,7 +12,8 @@ commit is stale and ignored (delivery-GUID dedupe lives in webhook
 ingestion). A build shared by multiple contexts (branch
 push + PR with identical tree) is only cancelled when superseded in
 all contexts referencing it; the same tree under another flake
-attribute is different content. PR close/merge cancels that PR's builds.
+attribute is different content. PR close/merge cancels that PR's builds,
+and deleting a branch cancels that branch's.
 
 `[skip ci]` / `[ci skip]` commit message markers are honored here too.
 """
@@ -162,14 +163,24 @@ class CancellationManager:
 
     def cancel_pr(self, project_id: int, pr_number: int) -> bool:
         """PR closed/merged: cancel its in-flight build (in that context)."""
-        context_key = branch_key("", pr_number)
+        return self._cancel_context(
+            project_id, branch_key("", pr_number), reason="pr closed"
+        )
+
+    def cancel_branch(self, project_id: int, branch: str) -> bool:
+        """Branch deleted: cancel its in-flight build (in that context)."""
+        return self._cancel_context(
+            project_id, branch_key(branch), reason="branch deleted"
+        )
+
+    def _cancel_context(self, project_id: int, context_key: str, reason: str) -> bool:
         build_id = self._by_context.get((project_id, context_key))
         if build_id is None:
             return False
         build = self._builds.get(build_id)
         if build is None:
             return False
-        self._release_context(build, context_key, reason="pr closed")
+        self._release_context(build, context_key, reason=reason)
         return True
 
     def running_commit_for(self, project_id: int, context_key: str) -> str | None:

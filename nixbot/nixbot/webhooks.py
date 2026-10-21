@@ -170,6 +170,34 @@ def _actor(forge: str, payload: dict[str, Any]) -> str | None:
 
 
 @dataclass(frozen=True)
+class BranchDeleted:
+    """A push deleted a branch. Its in-flight and queued builds have no
+    branch left to report to, so they are cancelled (merge queues delete
+    the branch of every batch they drop)."""
+
+    forge: str
+    forge_repo_id: str
+    branch: str
+    actor: str | None = None
+
+
+def _deleted(head: str) -> bool:
+    """Every forge reports a deleted ref as a push to the zero commit."""
+    return bool(head) and set(head) == {"0"}
+
+
+def _branch_deleted(
+    forge: str, repo_id: str, pushed: tuple[str, str | None], actor: str | None
+) -> BranchDeleted | None:
+    """A deleted tag has no build to cancel: tag builds finish on their
+    own and nothing supersedes them."""
+    branch, tag = pushed
+    if tag is not None:
+        return None
+    return BranchDeleted(forge=forge, forge_repo_id=repo_id, branch=branch, actor=actor)
+
+
+@dataclass(frozen=True)
 class PrClosed:
     forge: str
     forge_repo_id: str
@@ -273,7 +301,13 @@ class PrApproved:
 
 
 WebhookEvent = (
-    ChangeRequest | PrClosed | PrComment | PrLabeled | CheckRerequested | PrApproved
+    ChangeRequest
+    | BranchDeleted
+    | PrClosed
+    | PrComment
+    | PrLabeled
+    | CheckRerequested
+    | PrApproved
 )
 
 
@@ -351,10 +385,12 @@ def parse_github_event(  # noqa: PLR0911
         return None
     if event_type == "push":
         pushed = _pushed_ref(payload.get("ref", ""))
-        if pushed is None or payload.get("deleted"):
+        if pushed is None:
             return None
         head = payload.get("after", "")
-        if not head or set(head) == {"0"}:
+        if payload.get("deleted") or _deleted(head):
+            return _branch_deleted("github", repo_id, pushed, _actor("github", payload))
+        if not head:
             return None
         head_commit = payload.get("head_commit") or {}
         branch, tag = pushed
@@ -426,7 +462,9 @@ def parse_gitea_event(  # noqa: PLR0911
         if pushed is None:
             return None
         head = payload.get("after", "")
-        if not head or set(head) == {"0"}:
+        if _deleted(head):
+            return _branch_deleted("gitea", repo_id, pushed, _actor("gitea", payload))
+        if not head:
             return None
         # Gitea lists `commits` oldest-first. The pushed head is
         # `head_commit` (fall back to the commit matching `after`).
@@ -541,7 +579,9 @@ def parse_gitlab_event(  # noqa: PLR0911
         if pushed is None:
             return None
         head = payload.get("after", "")
-        if not head or set(head) == {"0"}:
+        if _deleted(head):
+            return _branch_deleted("gitlab", repo_id, pushed, _actor("gitlab", payload))
+        if not head:
             return None
         head_commit: dict[str, Any] = next(
             (

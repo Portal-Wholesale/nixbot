@@ -30,7 +30,13 @@ from nixbot.forge import DiscoveredRepo
 from nixbot.schedule_runner import scheduled_worktree_id
 from nixbot.schedules import DueEffect, ScheduleWhen
 from nixbot.status import CheckRunStore, FailedStatusStore, ForgeStatusReporter
-from nixbot.webhooks import ChangeRequest, CheckRerequested, PrApproved, PrClosed
+from nixbot.webhooks import (
+    BranchDeleted,
+    ChangeRequest,
+    CheckRerequested,
+    PrApproved,
+    PrClosed,
+)
 from nixbot.work_queue import MAX_WORK_ATTEMPTS
 
 from .support import (
@@ -230,6 +236,41 @@ async def test_pr_close_discards_queued_changes(service: CIService) -> None:
     assert handled == []
     status = await pool.fetchval("SELECT status FROM work_queue WHERE kind = 'change'")
     assert status == "done"
+
+
+async def test_branch_delete_discards_queued_pushes(service: CIService) -> None:
+    """A queued push of a deleted branch must not build it later. A PR
+    into a branch of that name is not the branch's push."""
+
+    pool = service.pool
+    project_id = await seed_project(pool, "http://x")
+    forge_repo_id = await pool.fetchval(
+        "SELECT forge_repo_id FROM projects WHERE id = $1", project_id
+    )
+    branch = "mergify/merge-queue/abc"
+    push = ChangeRequest(
+        forge="github", forge_repo_id=forge_repo_id, branch=branch, commit_sha="abc"
+    )
+    pr = ChangeRequest(
+        forge="github",
+        forge_repo_id=forge_repo_id,
+        branch=branch,
+        commit_sha="def",
+        pr_number=12,
+    )
+    await service.submit(push)
+    await service.submit(pr)
+    await service.submit(
+        BranchDeleted(forge="github", forge_repo_id=forge_repo_id, branch=branch)
+    )
+    handled: list[Any] = []
+
+    async def fake_handle(event: Any, credentials: Any = None) -> None:
+        handled.append(event.commit_sha)
+
+    service.orchestrator.handle_change_event = fake_handle  # type: ignore[method-assign]
+    await service.drain_work()
+    assert handled == ["def"]
 
 
 async def test_build_branches_gates_branch_pushes(

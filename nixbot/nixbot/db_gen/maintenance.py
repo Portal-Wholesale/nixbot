@@ -34,6 +34,7 @@ __all__: collections.abc.Sequence[str] = (
     "reset_build_for_restart",
     "running_build_ids",
     "succeeded_attribute_outputs",
+    "supersede_pending_branch_changes",
     "supersede_pending_changes",
 )
 
@@ -275,6 +276,16 @@ WHERE kind = 'change' AND status = 'pending'
   AND (payload->>'pr_number')::int = $3::int
 """
 
+SUPERSEDE_PENDING_BRANCH_CHANGES: typing.Final[str] = """-- name: SupersedePendingBranchChanges :exec
+UPDATE work_queue SET status = 'done', finished_at = now()
+WHERE kind = 'change' AND status = 'pending'
+  AND payload->>'forge' = $1::text
+  AND payload->>'forge_repo_id' = $2::text
+  AND payload->>'pr_number' IS NULL
+  AND payload->>'tag' IS NULL
+  AND payload->>'branch' = $3::text
+"""
+
 CANCEL_ATTRIBUTE: typing.Final[str] = """-- name: CancelAttribute :execrows
 UPDATE build_attributes SET status = 'cancelled', finished_at = now()
 WHERE build_id = $1 AND attr = $2 AND status IN ('pending', 'building')
@@ -481,6 +492,10 @@ def all_build_ids(conn: ConnectionLike) -> QueryResults[int]:
 
 async def supersede_pending_changes(conn: ConnectionLike, *, forge: str, forge_repo_id: str, pr_number: int) -> None:
     await conn.execute(SUPERSEDE_PENDING_CHANGES, forge, forge_repo_id, pr_number)
+
+
+async def supersede_pending_branch_changes(conn: ConnectionLike, *, forge: str, forge_repo_id: str, branch: str) -> None:
+    await conn.execute(SUPERSEDE_PENDING_BRANCH_CHANGES, forge, forge_repo_id, branch)
 
 
 async def cancel_attribute(conn: ConnectionLike, *, build_id: int, attr: str) -> int:

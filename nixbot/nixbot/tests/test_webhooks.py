@@ -20,6 +20,7 @@ from nixbot import webhooks
 from nixbot.config import BranchConfig, BranchConfigDict
 from nixbot.gitrepo import RepoManager
 from nixbot.webhooks import (
+    BranchDeleted,
     ChangeRequest,
     CheckRerequested,
     DeliveryDeduper,
@@ -135,18 +136,26 @@ def test_parse_github_push() -> None:
     )
 
 
-def test_parse_github_branch_deletion_ignored() -> None:
-    assert (
-        parse_github_event(
-            "push",
-            {
-                "ref": "refs/heads/gone",
-                "after": "0" * 40,
-                "deleted": True,
-                "repository": {"id": 1},
-            },
-        )
-        is None
+def test_parse_branch_deletion() -> None:
+    deleted = {
+        "ref": "refs/heads/mergify/merge-queue/abc",
+        "after": "0" * 40,
+        "deleted": True,
+        "repository": {"id": 1},
+        "sender": {"login": "mergify[bot]"},
+    }
+    expected = BranchDeleted(
+        forge="github",
+        forge_repo_id="1",
+        branch="mergify/merge-queue/abc",
+        actor="github:mergify[bot]",
+    )
+    assert parse_github_event("push", deleted) == expected
+    # Gitea sends no `deleted` flag, only the zero commit.
+    del deleted["deleted"]
+    assert parse_github_event("push", deleted) == expected
+    assert parse_gitea_event("push", deleted) == replace(
+        expected, forge="gitea", actor="gitea:mergify[bot]"
     )
 
 
@@ -811,7 +820,9 @@ def test_parse_gitlab_events() -> None:
         commit_message="feat",
     )
     deleted = parse_gitlab_event("Push Hook", {**GITLAB_PUSH, "after": "0" * 40})
-    assert deleted is None
+    assert deleted == BranchDeleted(
+        forge="gitlab", forge_repo_id="8", branch="main", actor=push.actor
+    )
 
     mr = parse_gitlab_event("Merge Request Hook", GITLAB_MR)
     assert mr == ChangeRequest(
