@@ -116,6 +116,34 @@ def test_resolve_attribute_first_rule_wins() -> None:
     assert config.resolve_attribute("main", is_pull_request=False) == "second"
 
 
+def test_resolve_attribute_source_match() -> None:
+    config = BranchConfig.loads(
+        "[[attribute_branches]]\n"
+        'match = "main"\nsource_match = "update-*"\nattribute = "full"\n'
+        "[[attribute_branches]]\n"
+        'match = "*"\nattribute = "fast"\nevents = ["pull_request"]\n'
+    )
+
+    def resolve(branch: str, head_ref: str | None) -> str:
+        return config.resolve_attribute(branch, is_pull_request=True, head_ref=head_ref)
+
+    assert resolve("main", "update-nixpkgs") == "full"
+    assert resolve("main", "feature") == "fast"
+    # Both globs must match.
+    assert resolve("release", "update-nixpkgs") == "fast"
+    # An event without a head branch (e.g. reconstructed from a
+    # build) does not match a source_match rule.
+    assert resolve("main", None) == "fast"
+    # A push has no source branch, even with the rule's events
+    # defaulting to both.
+    assert (
+        config.resolve_attribute(
+            "main", is_pull_request=False, head_ref="update-nixpkgs"
+        )
+        == "checks"
+    )
+
+
 def test_resolve_attribute_events_omitted_means_both() -> None:
     config = BranchConfig.loads(
         '[[attribute_branches]]\nmatch = "main"\nattribute = "packages"\n'

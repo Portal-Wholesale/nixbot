@@ -38,6 +38,9 @@ class AttributeBranchRule(BaseModel):
     match: str
     attribute: str
     events: list[AttributeEvent] = ["push", "pull_request"]
+    # Pull request head branch glob, tested alongside `match`. A push
+    # never matches a rule that sets it.
+    source_match: str | None = None
 
 
 class BranchConfig(BaseModel):
@@ -56,13 +59,22 @@ class BranchConfig(BaseModel):
     # False opts out of the instance-wide contributor approval gate.
     require_approval: bool = True
 
-    def resolve_attribute(self, branch: str, *, is_pull_request: bool) -> str:
+    def resolve_attribute(
+        self, branch: str, *, is_pull_request: bool, head_ref: str | None = None
+    ) -> str:
         """Flake attribute to build for an event on `branch` (the base
-        branch for a pull request)."""
+        branch for a pull request, whose head branch is `head_ref`)."""
         event: AttributeEvent = "pull_request" if is_pull_request else "push"
         for rule in self.attribute_branches:
-            if event in rule.events and fnmatch(branch, rule.match):
-                return rule.attribute
+            if event not in rule.events or not fnmatch(branch, rule.match):
+                continue
+            if rule.source_match is not None and (
+                not is_pull_request
+                or head_ref is None
+                or not fnmatch(head_ref, rule.source_match)
+            ):
+                continue
+            return rule.attribute
         return self.attribute
 
     @classmethod

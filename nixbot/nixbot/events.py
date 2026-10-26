@@ -43,6 +43,8 @@ class ChangeEvent:
     pr_number: int | None = None
     pr_author: str | None = None
     base_sha: str | None = None
+    # The PR head branch name, for `source_match` rules.
+    head_ref: str | None = None
     commit_message: str = ""
     # Who caused this event, forge qualified ("github:alice"). None
     # for polled changes.

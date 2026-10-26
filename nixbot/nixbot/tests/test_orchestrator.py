@@ -624,6 +624,34 @@ async def test_main_push_does_not_reuse_pr_build_of_other_attribute(
     assert dict(row) == {"branch": "main", "pr_number": 7}
 
 
+async def test_pr_source_branch_selects_attribute(
+    make_env: EnvFactory, upstream: Path
+) -> None:
+    """A source_match rule picks the attribute by the PR's head
+    branch, which the event carries alongside its base branch."""
+    sha = add_config_commit(
+        upstream,
+        '[[attribute_branches]]\nmatch = "main"\nsource_match = "update-*"\n'
+        'attribute = "checks"\nevents = ["pull_request"]\n' + ATTRIBUTE_RULES,
+    )
+    eval_runner = FakeEvalRunner([mk_job("a")])
+    orchestrator, _, project = await make_env(
+        eval_runner, FakeExecutor(), name="attr-source"
+    )
+    build = await orchestrator.handle_change_event(
+        ChangeEvent(
+            repo=project,
+            branch="main",
+            commit_sha=sha,
+            pr_number=7,
+            head_ref="update-nixpkgs",
+        )
+    )
+    assert build is not None
+    assert build.attribute == "checks"
+    assert eval_runner.attributes == ["checks"]
+
+
 async def test_same_tree_and_attribute_share_one_build(
     make_env: EnvFactory, upstream: Path
 ) -> None:

@@ -213,13 +213,15 @@ def test_parse_github_pr() -> None:
             "title": "Add feature",
             "user": {"login": "alice"},
             "author_association": "FIRST_TIME_CONTRIBUTOR",
-            "head": {"sha": "headsha"},
+            "head": {"sha": "headsha", "ref": "feature"},
             "base": {"ref": "main", "sha": "basesha"},
         },
     }
     event = parse_github_event("pull_request", payload)
     assert isinstance(event, ChangeRequest)
     assert event.pr_number == 12
+    assert event.branch == "main"
+    assert event.head_ref == "feature"
     assert event.pr_author == "github:alice"
     assert event.author_association == "FIRST_TIME_CONTRIBUTOR"
     # The pusher, not the PR author, caused this event.
@@ -805,6 +807,7 @@ GITLAB_MR: dict[str, Any] = {
         "action": "update",
         "oldrev": "old",
         "target_branch": "main",
+        "source_branch": "feature",
         "last_commit": {"id": "def"},
     },
 }
@@ -835,6 +838,7 @@ def test_parse_gitlab_events() -> None:
         # No base sha in the payload: merge against the target branch.
         base_sha="refs/heads/main",
         actor="gitlab:bob",
+        head_ref="feature",
     )
     # A reopen by a maintainer must not hand them the author's
     # build-control rights.

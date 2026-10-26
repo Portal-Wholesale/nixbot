@@ -41,6 +41,7 @@ class RemoteHead:
     updated_at: datetime | None = None
     author_association: str | None = None
     head_in_base_repo: bool = False
+    head_ref: str | None = None
 
 
 def max_pr_updated(heads: list[RemoteHead]) -> datetime | None:
@@ -112,6 +113,7 @@ async def github_heads(
             author_association=pull.get("author_association"),
             head_in_base_repo=(pull["head"].get("repo") or {}).get("id")
             == pull["base"]["repo"]["id"],
+            head_ref=pull["head"].get("ref"),
         )
         for pull in pulls
     )
@@ -150,6 +152,7 @@ async def gitea_heads(
             pr_author=f"gitea:{pull['user']['login']}",
             base_sha=f"refs/heads/{pull['base']['ref']}",
             updated_at=datetime.fromisoformat(pull["updated_at"]),
+            head_ref=pull["head"].get("ref"),
         )
         for pull in pulls
     )
@@ -192,6 +195,7 @@ async def gitlab_heads(
             # target branch ref instead.
             base_sha=f"refs/heads/{pull['target_branch']}",
             updated_at=datetime.fromisoformat(pull["updated_at"]),
+            head_ref=pull.get("source_branch"),
         )
         for pull in pulls
     )
@@ -249,6 +253,7 @@ async def reconcile_repo(
                 base_sha=head.base_sha,
                 author_association=head.author_association,
                 head_in_base_repo=head.head_in_base_repo,
+                head_ref=head.head_ref,
             )
         )
         submitted += 1

@@ -613,6 +613,7 @@ async def test_gitlab_heads_carry_target_branch_base(pool: asyncpg.Pool) -> None
                         "iid": 5,
                         "sha": "head-mr5",
                         "target_branch": "main",
+                        "source_branch": "feature",
                         "author": {"username": "alice"},
                         "updated_at": "2026-06-09T10:00:00.000Z",
                     }
@@ -627,6 +628,7 @@ async def test_gitlab_heads_carry_target_branch_base(pool: asyncpg.Pool) -> None
     heads = await gitlab_heads(client, project)
     mr_head = next(h for h in heads if h.pr_number == 5)
     assert mr_head.base_sha == "refs/heads/main"
+    assert mr_head.head_ref == "feature"
 
 
 async def test_gitea_heads_encode_slashed_default_branch(pool: asyncpg.Pool) -> None:
