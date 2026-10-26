@@ -25,6 +25,7 @@ from .gcroots import GcrootRegistrationError
 from .gitrepo import GitError, run_git
 
 if TYPE_CHECKING:
+    from datetime import timedelta
     from pathlib import Path
 
     from .db import BuildRecord
@@ -135,12 +136,14 @@ async def reuse_terminal_build(  # noqa: PLR0913
     worktree_path: Path,
     credentials: FetchCredentials | None,
     incoming_stale: bool,
+    protect_grace: timedelta | None = None,
 ) -> None:
     """Same content already built in another context: only report
     the existing result for this context. Still register so an
     in-flight build of this context's previous content is
     superseded, and a push reusing a PR build gets its
-    gcroots/outputs updates."""
+    gcroots/outputs updates. A protected in-flight build is kept
+    (DEFERRED): nothing needs to run, so nothing waits either."""
     logger.info(
         "reusing build for tree hash",
         extra={"build_id": build.id_, "tree_hash": tree_hash},
@@ -154,6 +157,7 @@ async def reuse_terminal_build(  # noqa: PLR0913
         event.commit_sha,
         asyncio.Event(),
         incoming_is_ancestor_of_running=incoming_stale,
+        protect_grace=protect_grace,
     )
     if outcome == RegisterOutcome.STALE:
         # Redelivered out-of-order event: superseding the in-flight

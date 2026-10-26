@@ -452,6 +452,7 @@ class Orchestrator:
                 worktree_path=worktree_path,
                 credentials=credentials,
                 incoming_stale=incoming_stale,
+                protect_grace=protect_grace,
             )
             return
 

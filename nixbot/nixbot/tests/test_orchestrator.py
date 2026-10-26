@@ -3572,3 +3572,52 @@ async def test_pr_on_protected_base_branch_still_supersedes(
     assert await build_status(pool, p2.id_) == BuildStatus.SUCCEEDED
     assert not any(e[0] == "deferred" for e in env.reporter.events)
     assert await env.deferred() == []
+
+
+@pytest.mark.parametrize("protected", [True, False])
+async def test_reuse_of_terminal_tree_respects_protection(
+    protected_env: ProtectedEnvFactory,
+    upstream: Path,
+    pool: asyncpg.Pool,
+    protected: bool,
+) -> None:
+    """A revert on main matches an already built tree: its result is
+    reused, and it supersedes the running build only under grace."""
+    grace = 0 if protected else 3600
+    add_config_commit(
+        upstream,
+        f'[[protect_running_branches]]\nmatch = "main"\ngrace_seconds = {grace}\n',
+    )
+    env = await protected_env(f"protect-reuse-{protected}")
+    env.eval_runner.block = None
+    base_sha = add_commit(upstream, "base")
+    await env.push(base_sha)
+    base_id = await env.build_id(base_sha)
+    assert await build_status(pool, base_id) == BuildStatus.SUCCEEDED
+
+    env.eval_runner.block = asyncio.Event()
+    env.eval_runner.started = asyncio.Event()
+    r_sha = add_commit(upstream, "r")
+    r_task = await start_protected(env, r_sha)
+    r_id = await env.build_id(r_sha)
+    git(upstream, "revert", "--no-edit", "HEAD")
+    revert_sha = git(upstream, "rev-parse", "HEAD")
+
+    def reported() -> int:
+        return sum(1 for e in env.reporter.events if e[:2] == ("finished", base_id))
+
+    before = reported()
+    await env.push(revert_sha)
+    # Reused, not built: the revert has no build of its own.
+    assert await env.build_id(revert_sha) is None
+    assert reported() == before + 1
+    assert await env.deferred() == []
+    assert not any(e[0] == "deferred" for e in env.reporter.events)
+    if protected:
+        assert not env.orchestrator.cancel_events[r_id].is_set()
+    env.eval_runner.block.set()
+    await asyncio.wait_for(r_task, timeout=10)
+    assert await build_status(pool, r_id) == (
+        BuildStatus.SUCCEEDED if protected else BuildStatus.CANCELLED
+    )
+    assert await env.queued() == []
