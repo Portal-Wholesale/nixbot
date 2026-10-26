@@ -16,6 +16,7 @@ from nixbot import build_run, db
 from nixbot import migrations as migrations_mod
 from nixbot.build_scheduler import AttributeResult, AttributeStatus
 from nixbot.db_gen import builds as builds_q
+from nixbot.db_gen import deferred as deferred_q
 from nixbot.db_gen import maintenance as maintenance_q
 from nixbot.failed_builds import PostgresFailedBuildCache
 from nixbot.migrations import apply_migrations, load_migrations
@@ -934,3 +935,132 @@ async def test_eval_stats_lifecycle(pool: asyncpg.Pool) -> None:
     assert await duration() == (True, 38_000)
     await db.set_build_status(pool, build.id_, db.BuildStatus.PENDING)
     assert await duration() == (False, None)
+
+
+# --- Deferred changes ----------------------------------------------------------
+
+
+async def test_upsert_deferred_change_returns_replaced_build(
+    pool: asyncpg.Pool,
+) -> None:
+    project_id = await insert_project(pool, "deferred")
+    running = await insert_build(pool, project_id, number=1, status="building")
+    first = await insert_build(pool, project_id, number=2)
+    second = await insert_build(pool, project_id, number=3)
+
+    async def upsert(build_id: int) -> int | None:
+        return await deferred_q.upsert_deferred_change(
+            pool,
+            project_id=project_id,
+            context_key="branch/main",
+            build_id=build_id,
+            blocked_by_build_id=running,
+            change=json.dumps({"commit_sha": f"sha{build_id}"}),
+        )
+
+    assert await upsert(first) is None
+    assert await upsert(second) == first
+    # Re-deferring the same build replaces nothing worth cancelling.
+    assert await upsert(second) is None
+    assert await deferred_q.deferred_build_ids(pool) == [second]
+
+    taken = await deferred_q.take_deferred_change(
+        pool, project_id=project_id, context_key="branch/main"
+    )
+    assert taken is not None
+    assert (taken.build_id, taken.blocked_by_build_id) == (second, running)
+    assert json.loads(taken.change) == {"commit_sha": f"sha{second}"}
+    assert (
+        await deferred_q.take_deferred_change(
+            pool, project_id=project_id, context_key="branch/main"
+        )
+        is None
+    )
+
+
+async def test_upsert_deferred_change_concurrent_reports_loser(
+    postgres_dsn: str,
+) -> None:
+    # Racing pushes on an empty slot: one row survives and every other
+    # deferred build is reported as replaced, so none is left pending.
+    async with db_pool(postgres_dsn, min_size=5, max_size=5) as pool:
+        project_id = await insert_project(pool, "deferred-race")
+        running = await insert_build(pool, project_id, number=1, status="building")
+        builds = [await insert_build(pool, project_id, number=n) for n in range(2, 7)]
+        replaced = await asyncio.gather(
+            *(
+                deferred_q.upsert_deferred_change(
+                    pool,
+                    project_id=project_id,
+                    context_key="branch/main",
+                    build_id=build_id,
+                    blocked_by_build_id=running,
+                    change="{}",
+                )
+                for build_id in builds
+            )
+        )
+        survivors = await pool.fetch(
+            "SELECT build_id FROM deferred_changes WHERE project_id = $1",
+            project_id,
+        )
+        assert len(survivors) == 1
+        assert replaced.count(None) == 1
+        assert sorted([r for r in replaced if r is not None] + [survivors[0][0]]) == (
+            builds
+        )
+
+
+async def test_delete_deferred_for_branch(pool: asyncpg.Pool) -> None:
+    project_id = await insert_project(pool, "deferred-branch")
+    running = await insert_build(pool, project_id, number=1, status="building")
+    for number, key in enumerate(("branch/feat", "branch/other", "pr/7"), start=2):
+        build_id = await insert_build(pool, project_id, number=number)
+        await deferred_q.upsert_deferred_change(
+            pool,
+            project_id=project_id,
+            context_key=key,
+            build_id=build_id,
+            blocked_by_build_id=running,
+            change="{}",
+        )
+    feat = await pool.fetchval(
+        "SELECT build_id FROM deferred_changes WHERE context_key = 'branch/feat'"
+    )
+
+    deleted = await deferred_q.delete_deferred_for_branch(
+        pool, project_id=project_id, branch="feat"
+    )
+    assert deleted == [feat]
+    keys = await pool.fetch(
+        "SELECT context_key FROM deferred_changes WHERE project_id = $1"
+        " ORDER BY context_key",
+        project_id,
+    )
+    assert [r[0] for r in keys] == ["branch/other", "pr/7"]
+
+
+async def test_find_unfinished_builds_skips_deferred(pool: asyncpg.Pool) -> None:
+    project_id = await insert_project(pool, "deferred-recovery")
+    running = await insert_build(pool, project_id, number=1, status="building")
+    deferred = await insert_build(pool, project_id, number=2)
+    await deferred_q.upsert_deferred_change(
+        pool,
+        project_id=project_id,
+        context_key="branch/main",
+        build_id=deferred,
+        blocked_by_build_id=running,
+        change="{}",
+    )
+
+    async def unfinished() -> set[int]:
+        rows = await maintenance_q.find_unfinished_builds(
+            pool, statuses=["pending", "building"], build_id=None
+        )
+        return {row.id_ for row in rows if row.project_id == project_id}
+
+    assert await unfinished() == {running}
+    await deferred_q.take_deferred_change(
+        pool, project_id=project_id, context_key="branch/main"
+    )
+    assert await unfinished() == {running, deferred}

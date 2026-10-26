@@ -135,8 +135,11 @@ DELETE FROM build_attributes WHERE build_id = $1
 AND attr = ANY(sqlc.arg(attrs)::text[]);
 
 -- name: FindUnfinishedBuilds :many
+-- Deferred builds wait for their blocker; the deferred table, not
+-- recovery, decides when they run.
 SELECT * FROM builds WHERE status = ANY(sqlc.arg(statuses)::text[])
 AND (sqlc.narg(build_id)::bigint IS NULL OR id = sqlc.narg(build_id))
+AND NOT EXISTS (SELECT 1 FROM deferred_changes d WHERE d.build_id = builds.id)
 ORDER BY id;
 
 -- name: AttributesForBuilds :many

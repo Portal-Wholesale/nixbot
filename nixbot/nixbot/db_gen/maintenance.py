@@ -214,6 +214,7 @@ AND attr = ANY($2::text[])
 FIND_UNFINISHED_BUILDS: typing.Final[str] = """-- name: FindUnfinishedBuilds :many
 SELECT id, project_id, number, tree_hash, commit_sha, branch, pr_number, pr_author, status, status_generation, effects_started, error, created_at, started_at, finished_at, eval_warnings, eval_completed, effects_commit_sha, effects_branch, effects_pr_number, eval_duration_ms, actor, merged_pr_number, attribute FROM builds WHERE status = ANY($1::text[])
 AND ($2::bigint IS NULL OR id = $2)
+AND NOT EXISTS (SELECT 1 FROM deferred_changes d WHERE d.build_id = builds.id)
 ORDER BY id
 """
 
