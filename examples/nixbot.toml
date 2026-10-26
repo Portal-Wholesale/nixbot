@@ -24,6 +24,15 @@
 #attribute = "hydraJobs"
 #events = ["push"]
 
+# Running push builds of matching branches are not superseded by newer pushes
+# once they have run `grace_seconds`. Newer pushes wait in one slot per branch
+# (the newest replaces the waiting one) and run when the protected build
+# finishes. `match` is a branch glob and the first matching rule wins. Pull
+# requests, merge-queue branches and tags are unaffected.
+#[[protect_running_branches]]
+#match = "main"
+#grace_seconds = 300
+
 # Directory the flake is located in.
 #flake_dir = "."
 

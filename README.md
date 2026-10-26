@@ -155,6 +155,42 @@ attribute = "fastChecks"
 events = ["pull_request"]
 ```
 
+A newer push to a branch normally cancels ("supersedes") that branch's running
+build. A `[[protect_running_branches]]` rule stops that for long builds: `match`
+is a branch glob and `grace_seconds` how long a build may run before newer
+pushes stop superseding it. The first matching rule wins; with no match pushes
+supersede as usual. Rules apply to push events only and are read from the pushed
+branch's own `nixbot.toml`; pull requests, merge-queue branches and tags are
+unaffected.
+
+```toml
+[[protect_running_branches]]
+match = "main"
+grace_seconds = 300
+```
+
+For a push to a branch with a matching rule:
+
+| Running build        | New push                   | Result                                                                 |
+| -------------------- | -------------------------- | ---------------------------------------------------------------------- |
+| none                 | X                          | X runs                                                                 |
+| R, running < grace   | X                          | R is superseded, X runs                                                |
+| R, running ≥ grace   | X                          | R keeps running; X waits, with a pending "waiting for build #R" status |
+| R, with W waiting    | X                          | W is cancelled and reported as superseded; X waits instead             |
+| R, with W waiting    | X is an ancestor of W or R | X is ignored as stale                                                  |
+| R finishes (any way) | —                          | W runs; its own grace period starts then                               |
+
+Each branch has one waiting slot, and the newest push wins it, so the next build
+always tests the newest commit. Deleting the branch, closing a pull request and
+cancelling the build manually still cancel a protected build (and the waiting
+one, for branch deletion). The waiting commit is stored in the database, so it
+survives a restart: the protected build resumes on its own and the waiting one
+runs after it.
+
+Effects run for every completed build on an `effects_branches` branch, so with
+protection they run after each protected build finishes, one after another,
+instead of only when a build happens to escape supersede.
+
 By default, effects only run on the default branch. The `build_branches`,
 `effects_branches` and `effects_on_pull_requests` settings are always read from
 the **default branch's** `nixbot.toml` (via `git show`) so that pull request
