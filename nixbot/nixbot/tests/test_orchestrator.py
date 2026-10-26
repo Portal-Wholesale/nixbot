@@ -168,6 +168,11 @@ class RecordingReporter:
     ) -> None:
         self.events.append(("restarted", build.id_, attr))
 
+    async def build_deferred(
+        self, event: ChangeEvent, build: BuildRecord, blocked_by: BuildRecord
+    ) -> None:
+        self.events.append(("deferred", build.id_, blocked_by.id_))
+
     async def effect_started(
         self, event: ChangeEvent, build: BuildRecord, name: str
     ) -> None:

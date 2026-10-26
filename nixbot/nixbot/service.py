@@ -134,6 +134,11 @@ class RetryingReporter:
     ) -> None:
         await self.inner.build_restarted(event, build, attr)
 
+    async def build_deferred(
+        self, event: ChangeEvent, build: BuildRecord, blocked_by: BuildRecord
+    ) -> None:
+        await self.inner.build_deferred(event, build, blocked_by)
+
     async def effect_started(
         self, event: ChangeEvent, build: BuildRecord, name: str
     ) -> None:

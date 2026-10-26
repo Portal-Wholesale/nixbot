@@ -262,6 +262,20 @@ async def test_build_restarted_posts_pending_new_runs() -> None:
     ]
 
 
+async def test_build_deferred_posts_pending_waiting_for_blocker() -> None:
+    reporter, poster, _ = make_reporter()
+    blocker = replace(BUILD, id_=9, number=41)
+
+    await reporter.build_deferred(EVENT, replace(BUILD, status="pending"), blocker)
+    assert [(p.context, p.state, p.description) for p in poster.posts] == [
+        ("nixbot/nix-build", StatusState.pending, "waiting for build #41"),
+    ]
+    # The link is the deferred build's own page.
+    assert poster.posts[0].target_url == (
+        "https://ci.test/repos/github/acme/widget/builds/42"
+    )
+
+
 def test_eval_description_warning_count() -> None:
     assert eval_description(True, []) == "evaluation succeeded"
     assert eval_description(True, ["w"]) == "evaluation succeeded (1 warning)"

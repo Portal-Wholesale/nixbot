@@ -665,6 +665,19 @@ class ForgeStatusReporter:
             force_new=True,
         )
 
+    async def build_deferred(
+        self, event: ChangeEvent, build: BuildRecord, blocked_by: BuildRecord
+    ) -> None:
+        """A newer push waits while a protected build of its branch
+        keeps running."""
+        await self._post(
+            event,
+            build,
+            f"{self.context_prefix}/nix-build",
+            StatusState.pending,
+            f"waiting for build #{blocked_by.number}",
+        )
+
     async def _post_attribute_statuses(
         self,
         event: ChangeEvent,

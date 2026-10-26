@@ -120,6 +120,10 @@ class StatusReporter(Protocol):
         self, event: ChangeEvent, build: BuildRecord, attr: str | None
     ) -> None: ...
 
+    async def build_deferred(
+        self, event: ChangeEvent, build: BuildRecord, blocked_by: BuildRecord
+    ) -> None: ...
+
     async def effect_started(
         self, event: ChangeEvent, build: BuildRecord, name: str
     ) -> None: ...
@@ -167,6 +171,11 @@ class NullStatusReporter:
 
     async def build_restarted(
         self, event: ChangeEvent, build: BuildRecord, attr: str | None
+    ) -> None:
+        pass
+
+    async def build_deferred(
+        self, event: ChangeEvent, build: BuildRecord, blocked_by: BuildRecord
     ) -> None:
         pass
 
