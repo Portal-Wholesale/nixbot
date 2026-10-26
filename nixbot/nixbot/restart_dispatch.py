@@ -163,6 +163,7 @@ async def _reeval(
         ):
             await s.orchestrator.run_build(event, build, worktree_path)
     finally:
+        await s.orchestrator.finish_tracking(build.id_)
         s.orchestrator.release_run(build.id_)
 
 

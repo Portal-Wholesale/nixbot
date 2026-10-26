@@ -212,6 +212,10 @@ class CancellationManager:
         self._release_context(build, context_key, reason=reason)
         return True
 
+    def running_build_for(self, project_id: int, context_key: str) -> int | None:
+        """Id of the in-flight build for a context."""
+        return self._by_context.get((project_id, context_key))
+
     def running_commit_for(self, project_id: int, context_key: str) -> str | None:
         """Commit of the in-flight build for a context, for the caller's
         out-of-order (`git merge-base --is-ancestor`) check."""

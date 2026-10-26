@@ -8,7 +8,11 @@ from __future__ import annotations
 __all__: collections.abc.Sequence[str] = (
     "QueryResults",
     "deferred_build_ids",
+    "deferred_changes_blocked_by",
+    "delete_deferred_change",
     "delete_deferred_for_branch",
+    "get_deferred_change",
+    "list_deferred_changes",
     "take_deferred_change",
     "upsert_deferred_change",
 )
@@ -56,6 +60,23 @@ DELETE_DEFERRED_FOR_BRANCH: typing.Final[str] = """-- name: DeleteDeferredForBra
 DELETE FROM deferred_changes
 WHERE project_id = $1 AND context_key = 'branch/' || $2::text
 RETURNING build_id
+"""
+
+GET_DEFERRED_CHANGE: typing.Final[str] = """-- name: GetDeferredChange :one
+SELECT project_id, context_key, build_id, blocked_by_build_id, change, replaced_build_id, created_at FROM deferred_changes WHERE project_id = $1 AND context_key = $2
+"""
+
+DEFERRED_CHANGES_BLOCKED_BY: typing.Final[str] = """-- name: DeferredChangesBlockedBy :many
+SELECT project_id, context_key, build_id, blocked_by_build_id, change, replaced_build_id, created_at FROM deferred_changes WHERE blocked_by_build_id = $1 ORDER BY build_id
+"""
+
+LIST_DEFERRED_CHANGES: typing.Final[str] = """-- name: ListDeferredChanges :many
+SELECT project_id, context_key, build_id, blocked_by_build_id, change, replaced_build_id, created_at FROM deferred_changes ORDER BY build_id
+"""
+
+DELETE_DEFERRED_CHANGE: typing.Final[str] = """-- name: DeleteDeferredChange :execrows
+DELETE FROM deferred_changes
+WHERE project_id = $1 AND context_key = $2 AND build_id = $3
 """
 
 
@@ -121,3 +142,29 @@ def deferred_build_ids(conn: ConnectionLike) -> QueryResults[int]:
 
 def delete_deferred_for_branch(conn: ConnectionLike, *, project_id: int, branch: str) -> QueryResults[int]:
     return QueryResults(conn, DELETE_DEFERRED_FOR_BRANCH, operator.itemgetter(0), project_id, branch)
+
+
+async def get_deferred_change(conn: ConnectionLike, *, project_id: int, context_key: str) -> models.DeferredChange | None:
+    row = await conn.fetchrow(GET_DEFERRED_CHANGE, project_id, context_key)
+    if row is None:
+        return None
+    return models.DeferredChange(project_id=row[0], context_key=row[1], build_id=row[2], blocked_by_build_id=row[3], change=row[4], replaced_build_id=row[5], created_at=row[6])
+
+
+def deferred_changes_blocked_by(conn: ConnectionLike, *, blocked_by_build_id: int) -> QueryResults[models.DeferredChange]:
+    def _decode_hook(row: asyncpg.Record) -> models.DeferredChange:
+        return models.DeferredChange(project_id=row[0], context_key=row[1], build_id=row[2], blocked_by_build_id=row[3], change=row[4], replaced_build_id=row[5], created_at=row[6])
+
+    return QueryResults(conn, DEFERRED_CHANGES_BLOCKED_BY, _decode_hook, blocked_by_build_id)
+
+
+def list_deferred_changes(conn: ConnectionLike) -> QueryResults[models.DeferredChange]:
+    def _decode_hook(row: asyncpg.Record) -> models.DeferredChange:
+        return models.DeferredChange(project_id=row[0], context_key=row[1], build_id=row[2], blocked_by_build_id=row[3], change=row[4], replaced_build_id=row[5], created_at=row[6])
+
+    return QueryResults(conn, LIST_DEFERRED_CHANGES, _decode_hook)
+
+
+async def delete_deferred_change(conn: ConnectionLike, *, project_id: int, context_key: str, build_id: int) -> int:
+    r = await conn.execute(DELETE_DEFERRED_CHANGE, project_id, context_key, build_id)
+    return int(n) if (p := r.split()) and (n := p[-1]).isdigit() else 0

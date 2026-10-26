@@ -28,3 +28,18 @@ SELECT build_id FROM deferred_changes ORDER BY build_id;
 DELETE FROM deferred_changes
 WHERE project_id = $1 AND context_key = 'branch/' || sqlc.arg(branch)::text
 RETURNING build_id;
+
+-- name: GetDeferredChange :one
+SELECT * FROM deferred_changes WHERE project_id = $1 AND context_key = $2;
+
+-- name: DeferredChangesBlockedBy :many
+-- A finished build's waiting changes, in every context it held.
+SELECT * FROM deferred_changes WHERE blocked_by_build_id = $1 ORDER BY build_id;
+
+-- name: ListDeferredChanges :many
+SELECT * FROM deferred_changes ORDER BY build_id;
+
+-- name: DeleteDeferredChange :execrows
+-- Only the released row: a newer push may have replaced it since.
+DELETE FROM deferred_changes
+WHERE project_id = $1 AND context_key = $2 AND build_id = $3;

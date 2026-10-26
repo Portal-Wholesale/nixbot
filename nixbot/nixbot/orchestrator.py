@@ -11,11 +11,13 @@ without coupling.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from datetime import timedelta
+from typing import TYPE_CHECKING, Any, Protocol
 
 from . import (
     build_reuse,
@@ -34,6 +36,8 @@ from .canceller import (
     has_skip_ci_marker,
 )
 from .db import BuildStatus
+from .db_gen import builds as builds_q
+from .db_gen import deferred as deferred_q
 from .db_gen import events as ev_q
 from .db_gen import maintenance as q
 from .deliver import TAG_KIND
@@ -46,6 +50,7 @@ from .events import (
     NullStatusReporter,
     RepoInfo,
     StatusReporter,
+    event_for_build,
 )
 from .executor import (
     LogWriter,
@@ -69,6 +74,7 @@ if TYPE_CHECKING:
     from .build_scheduler import BuildOutcome, FailedBuildCache
     from .config import Config
     from .db import BuildRecord
+    from .db_gen.models import DeferredChange
     from .gitrepo import FetchCredentials, RepoManager
     from .models import NixEvalJobSuccess
     from .nix_eval import (
@@ -166,6 +172,9 @@ class Orchestrator:
     eval_slots: asyncio.Semaphore = field(init=False)
     # Pulsed on every release_run().
     _run_released: asyncio.Event = field(default_factory=asyncio.Event)
+    # Re-enqueues a deferred change (its stored ChangeRequest payload)
+    # once its blocking build finished. Set by the service.
+    release_deferred: Callable[[dict[str, Any]], Awaitable[None]] | None = None
 
     def __post_init__(self) -> None:
         self.eval_slots = asyncio.Semaphore(self.config.eval_concurrency)
@@ -174,6 +183,61 @@ class Orchestrator:
         self.cancel_events.pop(build_id, None)
         released, self._run_released = self._run_released, asyncio.Event()
         released.set()
+
+    async def finish_tracking(self, build_id: int) -> None:
+        """A run of the build ended: stop tracking it and release the
+        changes deferred behind it."""
+        self.canceller.complete(build_id)
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            # Shutdown: the build stays resumable, and whoever finishes
+            # it after recovery releases them.
+            return
+        try:
+            await self.release_deferred_behind(build_id)
+        except Exception:
+            logger.exception(
+                "releasing deferred changes failed", extra={"build_id": build_id}
+            )
+
+    async def release_deferred_behind(self, build_id: int) -> None:
+        for row in await deferred_q.deferred_changes_blocked_by(
+            self.pool, blocked_by_build_id=build_id
+        ):
+            await self.release_deferred_change(row)
+
+    async def release_deferred_change(self, row: DeferredChange) -> None:
+        """Re-enqueue a deferred change. The row stays until the
+        released change is dispatched (see _claim_deferred), so a crash
+        in between neither loses it nor lets recovery start the build."""
+        if self.release_deferred is None:
+            return
+        logger.info(
+            "releasing deferred change",
+            extra={"build_id": row.build_id, "context": row.context_key},
+        )
+        await self.release_deferred(json.loads(row.change))
+
+    async def cancel_deferred_build(self, repo: RepoInfo, build_id: int) -> None:
+        """A deferred build that will not run (replaced by a newer push,
+        or its branch deleted): cancelled and reported like a stale
+        one."""
+        build = await builds_q.get_build(self.pool, id_=build_id)
+        if build is None or build.status != BuildStatus.PENDING:
+            return
+        await db.set_build_status(self.pool, build_id, BuildStatus.CANCELLED)
+        await self.reporter.build_finished(
+            event_for_build(repo, build),
+            build,
+            BuildResult(BuildStatus.CANCELLED, build.status_generation, []),
+        )
+
+    async def cancel_deferred_branch(self, repo: RepoInfo, branch: str) -> None:
+        """Branch deleted: drop its waiting change."""
+        for build_id in await deferred_q.delete_deferred_for_branch(
+            self.pool, project_id=repo.id, branch=branch
+        ):
+            await self.cancel_deferred_build(repo, build_id)
 
     async def wait_idle(self, build_id: int) -> None:
         """Return once no run owns build_id (holds its cancel_events slot)."""
@@ -361,18 +425,19 @@ class Orchestrator:
         in-flight build, or run it."""
         repo = event.repo
         key = branch_key(event.branch, event.pr_number)
+        if event.released_from_deferral and not await self._claim_deferred(
+            event, build, key
+        ):
+            return
+        protect_grace = self._protect_grace(event, branch_config)
         # A branch push reusing a PR build already shed the PR identity
         # (and took over the branch field) in get_or_create_build.
-        # Out-of-order delivery check: an event whose commit is an
-        # ancestor of the context's running build is stale. Checked
-        # before the reuse branch too: a stale redelivery matching an
-        # old terminal build must not supersede the in-flight build.
-        incoming_stale = False
-        running_commit = self.canceller.running_commit_for(repo.id, key)
-        if running_commit is not None and running_commit != event.commit_sha:
-            incoming_stale = await build_reuse.is_ancestor(
-                self, repo.key, event.commit_sha, running_commit
-            )
+        # Checked before the reuse branch too: a stale redelivery
+        # matching an old terminal build must not supersede the
+        # in-flight build.
+        incoming_stale = await self._incoming_stale(
+            event, key, deferral=protect_grace is not None
+        )
 
         if not created and build.status in (
             BuildStatus.SUCCEEDED,
@@ -391,13 +456,17 @@ class Orchestrator:
             return
 
         in_flight = build.id_ in self.cancel_events
-        rebuild = created or (not in_flight and build.status == BuildStatus.CANCELLED)
+        rebuild = created or (
+            not in_flight
+            and (event.released_from_deferral or build.status == BuildStatus.CANCELLED)
+        )
         if rebuild or in_flight:
             cancel_event = self.cancel_events.setdefault(build.id_, asyncio.Event())
         else:
             # Not running here (e.g. crashed build awaiting recovery):
             # a stored entry would block its rerun.
             cancel_event = asyncio.Event()
+        blocker = self.canceller.running_build_for(repo.id, key)
         outcome = self.canceller.register(
             repo.id,
             key,
@@ -407,17 +476,24 @@ class Orchestrator:
             event.commit_sha,
             cancel_event,
             incoming_is_ancestor_of_running=incoming_stale,
+            protect_grace=protect_grace,
+            # A rebuild starts now. Otherwise the stored start, so a
+            # recovering build keeps its clock.
+            started_at=None if rebuild else build.started_at,
         )
         if outcome == RegisterOutcome.STALE:
             if rebuild:
                 self.release_run(build.id_)
-            if created:
+            if created or event.released_from_deferral:
                 await db.set_build_status(self.pool, build.id_, BuildStatus.CANCELLED)
                 await self.reporter.build_finished(
                     event,
                     build,
                     BuildResult(BuildStatus.CANCELLED, build.status_generation, []),
                 )
+            return
+        if outcome == RegisterOutcome.DEFERRED and rebuild and blocker is not None:
+            await self._defer(event, build, key, blocker)
             return
         if not rebuild:
             await build_reuse.attach_linked_event(self, event, build)
@@ -427,9 +503,91 @@ class Orchestrator:
                 event, build, worktree_path, branch_config, credentials
             )
         finally:
-            self.canceller.complete(build.id_)
+            await self.finish_tracking(build.id_)
             self.release_run(build.id_)
             self.linked_events.pop(build.id_, None)
+
+    def _protect_grace(
+        self, event: ChangeEvent, branch_config: BranchConfig | None
+    ) -> timedelta | None:
+        """Branch pushes only. Deferral re-enqueues the queued change,
+        so events without one are never deferred."""
+        if (
+            branch_config is None
+            or event.change is None
+            or event.pr_number is not None
+            or event.tag is not None
+        ):
+            return None
+        seconds = branch_config.protect_grace(event.branch)
+        return None if seconds is None else timedelta(seconds=seconds)
+
+    async def _incoming_stale(
+        self, event: ChangeEvent, key: str, *, deferral: bool
+    ) -> bool:
+        """Out-of-order delivery check: an event whose commit is an
+        ancestor of the context's running build is stale. With
+        `deferral`, so is an ancestor of the change waiting behind it."""
+        running_commit = self.canceller.running_commit_for(event.repo.id, key)
+        if (
+            running_commit is not None
+            and running_commit != event.commit_sha
+            and await build_reuse.is_ancestor(
+                self, event.repo.key, event.commit_sha, running_commit
+            )
+        ):
+            return True
+        if not deferral:
+            return False
+        deferred = await deferred_q.get_deferred_change(
+            self.pool, project_id=event.repo.id, context_key=key
+        )
+        if deferred is None:
+            return False
+        deferred_commit = json.loads(deferred.change)["commit_sha"]
+        if deferred_commit == event.commit_sha:
+            return False
+        return await build_reuse.is_ancestor(
+            self, event.repo.key, event.commit_sha, deferred_commit
+        )
+
+    async def _claim_deferred(
+        self, event: ChangeEvent, build: BuildRecord, key: str
+    ) -> bool:
+        """A released change runs only while it still holds its slot:
+        a newer push may have replaced it, a branch delete dropped it, or
+        a redelivered release already ran it."""
+        claimed = await deferred_q.delete_deferred_change(
+            self.pool, project_id=event.repo.id, context_key=key, build_id=build.id_
+        )
+        # Cancelled by hand while it waited: stays cancelled.
+        return claimed == 1 and build.status == BuildStatus.PENDING
+
+    async def _defer(
+        self, event: ChangeEvent, build: BuildRecord, key: str, blocker: int
+    ) -> None:
+        """Park the change behind the context's protected build. The
+        build stays pending until finish_tracking releases it."""
+        self.release_run(build.id_)
+        if build.status == BuildStatus.CANCELLED:
+            await db.set_build_status(self.pool, build.id_, BuildStatus.PENDING)
+        replaced = await deferred_q.upsert_deferred_change(
+            self.pool,
+            project_id=event.repo.id,
+            context_key=key,
+            build_id=build.id_,
+            blocked_by_build_id=blocker,
+            change=json.dumps(event.change),
+        )
+        if replaced is not None:
+            await self.cancel_deferred_build(event.repo, replaced)
+        blocked_by = await builds_q.get_build(self.pool, id_=blocker)
+        if blocked_by is not None:
+            await self.reporter.build_deferred(event, build, blocked_by)
+        if self.canceller.running_build_for(event.repo.id, key) != blocker:
+            # The blocker finished while the row was written, after its
+            # finish_tracking looked for rows to release.
+            await self.release_deferred_behind(blocker)
 
     async def run_build(
         self,

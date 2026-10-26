@@ -21,6 +21,7 @@ from .config import ScheduleWhen
 from .db import BuildStatus
 from .db_gen import approvals as approvals_q
 from .db_gen import builds as builds_q
+from .db_gen import deferred as deferred_q
 from .db_gen import events as ev_q
 from .db_gen import failed as failed_q
 from .db_gen import maintenance as q
@@ -222,6 +223,9 @@ class CIService:
     _started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     event_listings: EventListingCache = field(default_factory=EventListingCache)
 
+    def __post_init__(self) -> None:
+        self.orchestrator.release_deferred = self._release_deferred
+
     @property
     def forge_pr(self) -> ForgePrClient:
         return ForgePrClient(self.github, self.gitea, self.gitlab)
@@ -301,6 +305,9 @@ class CIService:
         project = await self.repo_store.by_forge_id(event.forge, event.forge_repo_id)
         if project is not None:
             self.orchestrator.canceller.cancel_branch(project.id_, event.branch)
+            await self.orchestrator.cancel_deferred_branch(
+                repo_info(project), event.branch
+            )
         # Queued pushes of the branch would build it after the delete.
         await q.supersede_pending_branch_changes(
             self.pool,
@@ -380,6 +387,11 @@ class CIService:
             "change",
             f"change-{change.forge}-{change.forge_repo_id}-{change.commit_sha}",
             dataclasses.asdict(change),
+        )
+
+    async def _release_deferred(self, payload: dict[str, Any]) -> None:
+        await self._submit_change(
+            dataclasses.replace(ChangeRequest(**payload), released_from_deferral=True)
         )
 
     async def approve_pr(
@@ -485,6 +497,8 @@ class CIService:
             commit_message=change.commit_message,
             actor=change.actor,
             tag=change.tag,
+            change=dataclasses.asdict(change),
+            released_from_deferral=change.released_from_deferral,
         )
         await self.orchestrator.handle_change_event(event, credentials)
 
@@ -798,7 +812,9 @@ class CIService:
         rows) re-evaluate via the rerun path."""
         settled_effects = await fail_interrupted_effects(self.pool, self._started_at)
         await self._report_interrupted_effects(settled_effects)
+        resumed: set[int] = set()
         for resumable in await find_unfinished_builds(self.pool):
+            resumed.add(resumable.build_id)
             remaining, settled = await settle_already_built(self.pool, resumable)
             if settled:
                 # Recovered results still need gcroots/outputs updates.
@@ -814,6 +830,12 @@ class CIService:
                 f"build-{resumable.build_id}",
                 {"build_id": resumable.build_id},
             )
+        # A resumed blocker releases its deferred changes when it
+        # finishes. The others' blockers finished or were cleaned up
+        # while the service was down.
+        for row in await deferred_q.list_deferred_changes(self.pool):
+            if row.blocked_by_build_id not in resumed:
+                await self.orchestrator.release_deferred_change(row)
 
     async def _report_interrupted_effects(
         self, settled: Sequence[q.FailInterruptedEffectsRow]

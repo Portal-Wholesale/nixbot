@@ -8,7 +8,7 @@ build pipeline.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -50,6 +50,12 @@ class ChangeEvent:
     # Tag pushes: the tag, also held in `branch`. Its onPush effects run
     # as a delivery of their own, see deliver.py.
     tag: str | None = None
+    # The queued ChangeRequest payload behind this event, stored when the
+    # build is deferred so it can be re-enqueued. None for direct
+    # callers, whose pushes are never deferred.
+    change: dict[str, Any] | None = field(default=None, compare=False)
+    # A deferred push re-enqueued after its blocking build finished.
+    released_from_deferral: bool = False
 
 
 def event_for_build(repo: RepoInfo, build: BuildRecord) -> ChangeEvent:

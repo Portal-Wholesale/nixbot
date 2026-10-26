@@ -6,9 +6,10 @@ real git repos, fake eval and executor."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import shutil
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -35,6 +36,9 @@ from nixbot.models import CacheStatus
 from nixbot.nix_eval import EvalError, EvalResult, EvalSettings
 from nixbot.orchestrator import AttributeExecutor, EvalRunnerLike, Orchestrator
 from nixbot.recovery import fail_interrupted_effects
+from nixbot.repos import RepoStore
+from nixbot.service import CIService
+from nixbot.webhooks import BranchDeleted, ChangeRequest
 from nixbot.work_queue import WorkItem, WorkQueue
 
 from .support import (
@@ -3181,3 +3185,390 @@ async def test_reuse_with_missing_output_still_post_processes(
     assert await pool.fetchval(
         "SELECT count(*) FROM work_queue WHERE kind = 'refresh-schedules'"
     )
+
+
+# --- protected running branch builds -------------------------------------------
+
+# Any running main build is protected: newer pushes wait behind it.
+PROTECT_MAIN = """
+[[protect_running_branches]]
+match = "main"
+grace_seconds = 0
+"""
+
+
+@dataclass
+class ProtectedEnv:
+    """Pushes go through the service, so deferral and release use the
+    real work queue payloads."""
+
+    pool: asyncpg.Pool
+    service: CIService
+    reporter: RecordingReporter
+    project: RepoInfo
+    eval_runner: FakeEvalRunner
+    executor: FakeExecutor
+
+    @property
+    def orchestrator(self) -> Orchestrator:
+        return self.service.orchestrator
+
+    def change(self, sha: str) -> ChangeRequest:
+        return ChangeRequest(
+            forge="github",
+            forge_repo_id=f"id-{self.project.repo}",
+            branch="main",
+            commit_sha=sha,
+        )
+
+    async def push(self, sha: str) -> None:
+        await self.service.submit(self.change(sha))
+        await self.drain()
+
+    def start(self, sha: str) -> asyncio.Task[None]:
+        """Process a push in the background, outside the queue so the
+        task ends with its build."""
+        return asyncio.create_task(
+            self.service._process_change(self.change(sha), last_attempt=False)  # noqa: SLF001
+        )
+
+    async def drain(self) -> None:
+        """Run this project's queued changes and reruns in order,
+        failing the test on errors. Other work is left alone."""
+        while items := await self.queued_items():
+            item = items[0]
+            await self.pool.execute(
+                "UPDATE work_queue SET status = 'done' WHERE id = $1", item.id
+            )
+            await self.service._dispatch_work(item)  # noqa: SLF001
+
+    async def build_id(self, sha: str) -> int:
+        return await self.pool.fetchval(
+            "SELECT id FROM builds WHERE project_id = $1 AND commit_sha = $2",
+            self.project.id,
+            sha,
+        )
+
+    async def deferred(self) -> list[tuple[int, int]]:
+        rows = await self.pool.fetch(
+            "SELECT build_id, blocked_by_build_id FROM deferred_changes "
+            "WHERE project_id = $1",
+            self.project.id,
+        )
+        return [(r["build_id"], r["blocked_by_build_id"]) for r in rows]
+
+    async def queued_items(self) -> list[WorkItem]:
+        """Pending changes and reruns of this project, oldest first."""
+        rows = await self.pool.fetch(
+            "SELECT id, kind, dedup_key, payload FROM work_queue "
+            "WHERE status = 'pending' AND ("
+            "(kind = 'change' AND payload->>'forge_repo_id' = $2) OR "
+            "(kind = 'rerun' AND (payload->>'build_id')::bigint IN "
+            "(SELECT id FROM builds WHERE project_id = $1))) ORDER BY id",
+            self.project.id,
+            f"id-{self.project.repo}",
+        )
+        return [
+            WorkItem(r["id"], r["kind"], r["dedup_key"], json.loads(r["payload"]))
+            for r in rows
+        ]
+
+    async def queued(self) -> list[tuple[str, str]]:
+        return [(item.kind, item.dedup_key) for item in await self.queued_items()]
+
+
+type ProtectedEnvFactory = Callable[[str], Awaitable[ProtectedEnv]]
+
+
+@pytest.fixture
+def protected_env(
+    pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
+) -> ProtectedEnvFactory:
+    async def make(name: str) -> ProtectedEnv:
+        if not (upstream / "nixbot.toml").exists():
+            add_config_commit(upstream, PROTECT_MAIN)
+        eval_runner = FakeEvalRunner([mk_job("a")], block=asyncio.Event())
+        executor = FakeExecutor()
+        orchestrator, reporter, project = await make_env(eval_runner, executor, name)
+        await pool.execute(
+            "UPDATE projects SET url = $1 WHERE id = $2", str(upstream), project.id
+        )
+        service = CIService(
+            config=orchestrator.config,
+            pool=pool,
+            orchestrator=orchestrator,
+            repo_store=RepoStore(pool),
+        )
+        return ProtectedEnv(pool, service, reporter, project, eval_runner, executor)
+
+    return make
+
+
+async def start_protected(env: ProtectedEnv, sha: str) -> asyncio.Task[None]:
+    task = env.start(sha)
+    await asyncio.wait_for(env.eval_runner.started.wait(), timeout=10)
+    return task
+
+
+async def test_protected_build_defers_newer_push(
+    protected_env: ProtectedEnvFactory, upstream: Path, pool: asyncpg.Pool
+) -> None:
+    env = await protected_env("protect-defer")
+    r_sha = add_commit(upstream, "r")
+    r_task = await start_protected(env, r_sha)
+    x_sha = add_commit(upstream, "x")
+    await env.push(x_sha)
+    r_id, x_id = await env.build_id(r_sha), await env.build_id(x_sha)
+    assert await build_status(pool, x_id) == BuildStatus.PENDING
+    assert ("deferred", x_id, r_id) in env.reporter.events
+    assert await env.deferred() == [(x_id, r_id)]
+    # R keeps running alone.
+    assert list(env.orchestrator.cancel_events) == [r_id]
+    assert not env.orchestrator.cancel_events[r_id].is_set()
+    assert env.eval_runner.calls == 1
+    assert env.eval_runner.block is not None
+    env.eval_runner.block.set()
+    await r_task
+    assert await build_status(pool, r_id) == BuildStatus.SUCCEEDED
+
+
+async def test_newer_push_replaces_deferred_one(
+    protected_env: ProtectedEnvFactory, upstream: Path, pool: asyncpg.Pool
+) -> None:
+    env = await protected_env("protect-replace")
+    r_sha = add_commit(upstream, "r")
+    r_task = await start_protected(env, r_sha)
+    d_sha = add_commit(upstream, "d")
+    await env.push(d_sha)
+    x_sha = add_commit(upstream, "x")
+    await env.push(x_sha)
+    r_id, d_id, x_id = [await env.build_id(s) for s in (r_sha, d_sha, x_sha)]
+    assert await build_status(pool, d_id) == BuildStatus.CANCELLED
+    assert any(
+        e[:3] == ("finished", d_id, BuildStatus.CANCELLED) for e in env.reporter.events
+    )
+    assert await build_status(pool, x_id) == BuildStatus.PENDING
+    assert await env.deferred() == [(x_id, r_id)]
+    assert not env.orchestrator.cancel_events[r_id].is_set()
+    assert env.eval_runner.block is not None
+    env.eval_runner.block.set()
+    await r_task
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
+async def test_deferred_push_runs_after_protected_build(
+    protected_env: ProtectedEnvFactory,
+    upstream: Path,
+    pool: asyncpg.Pool,
+    outcome: str,
+) -> None:
+    env = await protected_env(f"protect-release-{outcome}")
+    r_sha = add_commit(upstream, "r")
+    r_task = await start_protected(env, r_sha)
+    d_sha = add_commit(upstream, "d")
+    await env.push(d_sha)
+    r_id, d_id = await env.build_id(r_sha), await env.build_id(d_sha)
+    if outcome == "failure":
+        env.executor.outcomes = {"a": BuildOutcome.failure}
+    if outcome == "cancel":
+        await env.service.cancel_build(r_id)
+        await r_task
+    assert env.eval_runner.block is not None
+    env.eval_runner.block.set()
+    await r_task
+    assert (
+        await build_status(pool, r_id)
+        == {
+            "success": BuildStatus.SUCCEEDED,
+            "failure": BuildStatus.FAILED,
+            "cancel": BuildStatus.CANCELLED,
+        }[outcome]
+    )
+    # Released through the work queue; the slot is held until D runs.
+    assert await env.queued() == [
+        ("change", f"change-github-id-{env.project.repo}-{d_sha}")
+    ]
+    env.executor.gate = asyncio.Event()
+    env.executor.started = asyncio.Event()
+    released_at = datetime.now(UTC)
+    drain = asyncio.create_task(env.drain())
+    await asyncio.wait_for(env.executor.started.wait(), timeout=10)
+    # D's grace period starts with its own run.
+    tracked = env.orchestrator.canceller._builds[d_id]  # noqa: SLF001
+    assert tracked.started_at >= released_at
+    env.executor.gate.set()
+    await drain
+    assert await build_status(pool, d_id) == (
+        BuildStatus.FAILED if outcome == "failure" else BuildStatus.SUCCEEDED
+    )
+    assert env.eval_runner.calls == 2
+    assert await env.deferred() == []
+
+
+async def test_older_push_than_deferred_one_is_stale(
+    protected_env: ProtectedEnvFactory, upstream: Path, pool: asyncpg.Pool
+) -> None:
+    """Out-of-order redelivery of a commit between R and D: newer than
+    the running build, older than the waiting one."""
+    env = await protected_env("protect-stale")
+    r_sha = add_commit(upstream, "r")
+    mid_sha = add_commit(upstream, "mid")
+    d_sha = add_commit(upstream, "d")
+    r_task = await start_protected(env, r_sha)
+    await env.push(d_sha)
+    await env.push(mid_sha)
+    r_id, mid_id, d_id = [await env.build_id(s) for s in (r_sha, mid_sha, d_sha)]
+    assert await build_status(pool, mid_id) == BuildStatus.CANCELLED
+    assert not any(e[:2] == ("deferred", mid_id) for e in env.reporter.events)
+    assert await env.deferred() == [(d_id, r_id)]
+    assert await build_status(pool, d_id) == BuildStatus.PENDING
+    assert env.eval_runner.block is not None
+    env.eval_runner.block.set()
+    await r_task
+
+
+async def test_concurrent_pushes_leave_one_deferred(
+    protected_env: ProtectedEnvFactory, upstream: Path, pool: asyncpg.Pool
+) -> None:
+    env = await protected_env("protect-race")
+    r_sha = add_commit(upstream, "r")
+    r_task = await start_protected(env, r_sha)
+    x1_sha = add_commit(upstream, "x1")
+    x2_sha = add_commit(upstream, "x2")
+    await asyncio.gather(
+        env.service._process_change(env.change(x1_sha), last_attempt=False),  # noqa: SLF001
+        env.service._process_change(env.change(x2_sha), last_attempt=False),  # noqa: SLF001
+    )
+    r_id = await env.build_id(r_sha)
+    ids = [await env.build_id(s) for s in (x1_sha, x2_sha)]
+    deferred = await env.deferred()
+    assert len(deferred) == 1
+    (waiting, blocker) = deferred[0]
+    assert blocker == r_id
+    assert waiting in ids
+    for build_id in ids:
+        assert await build_status(pool, build_id) == (
+            BuildStatus.PENDING if build_id == waiting else BuildStatus.CANCELLED
+        )
+    assert env.eval_runner.block is not None
+    env.eval_runner.block.set()
+    await r_task
+
+
+async def test_branch_delete_cancels_protected_and_deferred(
+    protected_env: ProtectedEnvFactory, upstream: Path, pool: asyncpg.Pool
+) -> None:
+    env = await protected_env("protect-delete")
+    r_sha = add_commit(upstream, "r")
+    r_task = await start_protected(env, r_sha)
+    d_sha = add_commit(upstream, "d")
+    await env.push(d_sha)
+    r_id, d_id = await env.build_id(r_sha), await env.build_id(d_sha)
+    await env.service.submit(
+        BranchDeleted(
+            forge="github", forge_repo_id=f"id-{env.project.repo}", branch="main"
+        )
+    )
+    await asyncio.wait_for(r_task, timeout=10)
+    assert await build_status(pool, r_id) == BuildStatus.CANCELLED
+    assert await build_status(pool, d_id) == BuildStatus.CANCELLED
+    assert any(
+        e[:3] == ("finished", d_id, BuildStatus.CANCELLED) for e in env.reporter.events
+    )
+    assert await env.deferred() == []
+    assert await env.queued() == []
+
+
+async def test_recovery_resumes_protected_build_before_deferred(
+    protected_env: ProtectedEnvFactory,
+    make_env: EnvFactory,
+    upstream: Path,
+    pool: asyncpg.Pool,
+) -> None:
+    """Crash while R runs and D waits: recovery resumes R only, and D
+    runs once R finished."""
+    env = await protected_env("protect-crash")
+    r_sha = add_commit(upstream, "r")
+    r_task = await start_protected(env, r_sha)
+    d_sha = add_commit(upstream, "d")
+    await env.push(d_sha)
+    r_id, d_id = await env.build_id(r_sha), await env.build_id(d_sha)
+    r_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await r_task
+    # The interrupted run must not release D.
+    assert await env.queued() == []
+
+    after = await protected_env("protect-crash")
+    assert after.eval_runner.block is not None
+    after.eval_runner.block.set()
+    await after.service.recover_unfinished_builds()
+    assert await after.queued() == [("rerun", f"build-{r_id}")]
+    await after.drain()
+    assert await build_status(pool, r_id) == BuildStatus.SUCCEEDED
+    assert await build_status(pool, d_id) == BuildStatus.SUCCEEDED
+    assert after.eval_runner.calls == 2
+    assert await after.deferred() == []
+
+
+async def test_crash_between_release_and_run_runs_deferred_once(
+    protected_env: ProtectedEnvFactory, upstream: Path, pool: asyncpg.Pool
+) -> None:
+    env = await protected_env("protect-release-crash")
+    r_sha = add_commit(upstream, "r")
+    r_task = await start_protected(env, r_sha)
+    d_sha = add_commit(upstream, "d")
+    await env.push(d_sha)
+    d_id = await env.build_id(d_sha)
+    assert env.eval_runner.block is not None
+    env.eval_runner.block.set()
+    await r_task
+    released = [("change", f"change-github-id-{env.project.repo}-{d_sha}")]
+    assert await env.queued() == released
+
+    after = await protected_env("protect-release-crash")
+    assert after.eval_runner.block is not None
+    after.eval_runner.block.set()
+    await after.service.recover_unfinished_builds()
+    # Not resumed as a rerun, and the sweep's release is the same item.
+    assert await after.queued() == released
+    await after.drain()
+    assert await build_status(pool, d_id) == BuildStatus.SUCCEEDED
+    assert after.eval_runner.calls == 1
+    assert await after.deferred() == []
+
+
+async def test_pr_on_protected_base_branch_still_supersedes(
+    protected_env: ProtectedEnvFactory, upstream: Path, pool: asyncpg.Pool
+) -> None:
+    env = await protected_env("protect-pr")
+    p1_sha = add_commit(upstream, "p1")
+    p2_sha = add_commit(upstream, "p2")
+
+    def pr_event(sha: str) -> ChangeEvent:
+        change = replace(env.change(sha), pr_number=5)
+        return ChangeEvent(
+            repo=env.project,
+            branch="main",
+            commit_sha=sha,
+            pr_number=5,
+            change=asdict(change),
+        )
+
+    p1_task = asyncio.create_task(
+        env.orchestrator.handle_change_event(pr_event(p1_sha))
+    )
+    await asyncio.wait_for(env.eval_runner.started.wait(), timeout=10)
+    p2_task = asyncio.create_task(
+        env.orchestrator.handle_change_event(pr_event(p2_sha))
+    )
+    p1 = await asyncio.wait_for(p1_task, timeout=10)
+    assert p1 is not None
+    assert await build_status(pool, p1.id_) == BuildStatus.CANCELLED
+    assert env.eval_runner.block is not None
+    env.eval_runner.block.set()
+    p2 = await p2_task
+    assert p2 is not None
+    assert await build_status(pool, p2.id_) == BuildStatus.SUCCEEDED
+    assert not any(e[0] == "deferred" for e in env.reporter.events)
+    assert await env.deferred() == []

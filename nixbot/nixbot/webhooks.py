@@ -156,6 +156,8 @@ class ChangeRequest:
     # own context. commit_sha may be an annotated tag object until the
     # service peels it.
     tag: str | None = None
+    # Re-enqueued once the protected build it waited behind finished.
+    released_from_deferral: bool = False
 
 
 def _actor(forge: str, payload: dict[str, Any]) -> str | None:

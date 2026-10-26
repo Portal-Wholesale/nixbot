@@ -104,6 +104,8 @@ async def rerun_pending_attributes(
             build.attribute,
             build.commit_sha,
             cancel_event,
+            # A recovered build keeps its clock for the protect grace.
+            started_at=build.started_at,
         )
         async with rerun_worktree(o, info, build, "rerun", credentials) as (
             event,
@@ -125,7 +127,7 @@ async def rerun_pending_attributes(
                 cache_failures=False,
             )
     finally:
-        o.canceller.complete(build.id_)
+        await o.finish_tracking(build.id_)
         o.release_run(build.id_)
 
 
