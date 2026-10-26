@@ -13,7 +13,9 @@ ingestion). A build shared by multiple contexts (branch
 push + PR with identical tree) is only cancelled when superseded in
 all contexts referencing it; the same tree under another flake
 attribute is different content. PR close/merge cancels that PR's builds,
-and deleting a branch cancels that branch's.
+and deleting a branch cancels that branch's. A build that has run
+past its branch's protect grace period is not superseded; the caller
+defers the newer change instead.
 
 `[skip ci]` / `[ci skip]` commit message markers are honored here too.
 """
@@ -23,10 +25,12 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import asyncio
+    from datetime import timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +65,8 @@ class InFlightBuild:
     attribute: str
     commit_sha: str
     cancel_event: asyncio.Event
+    # When the build started running, for the protect grace period.
+    started_at: datetime
     contexts: set[str] = field(default_factory=set)
 
 
@@ -68,6 +74,7 @@ class RegisterOutcome:
     NEW = "new"
     DUPLICATE = "duplicate"  # same content, build shared/reused
     STALE = "stale"  # incoming commit is older than the running one
+    DEFERRED = "deferred"  # running build is protected; incoming waits
 
 
 class CancellationManager:
@@ -87,13 +94,23 @@ class CancellationManager:
         cancel_event: asyncio.Event,
         *,
         incoming_is_ancestor_of_running: bool = False,
+        protect_grace: timedelta | None = None,
+        now: datetime | None = None,
+        started_at: datetime | None = None,
     ) -> str:
         """Track a build for a context, superseding any previous one.
 
         `incoming_is_ancestor_of_running` should be the result of a
         `git merge-base --is-ancestor <incoming> <running>` check by the
         caller. When true the event is out-of-order and ignored.
+
+        With `protect_grace`, a previous build that has run at least
+        that long is kept and the incoming build is DEFERRED (not
+        tracked). `started_at` is the incoming build's start (the DB
+        value on recovery re-registration); it defaults to `now`.
         """
+        if now is None:
+            now = datetime.now(tz=UTC)
         build = self._builds.get(build_id)
         if build is not None:
             # Re-registration (e.g. crash recovery) comes with a fresh
@@ -122,6 +139,17 @@ class CancellationManager:
                         },
                     )
                     return RegisterOutcome.STALE
+                if protect_grace is not None and now - old.started_at >= protect_grace:
+                    logger.info(
+                        "deferring change behind protected build",
+                        extra={
+                            "project_id": project_id,
+                            "context": context_key,
+                            "build_id": build_id,
+                            "blocked_by_build_id": old.build_id,
+                        },
+                    )
+                    return RegisterOutcome.DEFERRED
                 self._release_context(old, context_key, reason="superseded")
 
         if build is None:
@@ -132,6 +160,7 @@ class CancellationManager:
                 attribute=attribute,
                 commit_sha=commit_sha,
                 cancel_event=cancel_event,
+                started_at=started_at if started_at is not None else now,
             )
             self._builds[build_id] = build
         build.contexts.add(context_key)

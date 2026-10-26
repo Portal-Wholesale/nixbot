@@ -156,6 +156,47 @@ def test_resolve_attribute_merge_queue_push_without_matching_rule() -> None:
     assert config.resolve_attribute(branch, is_pull_request=False) == "hydraJobs"
 
 
+def test_protect_grace_default_is_none(tmp_path: Path) -> None:
+    config = BranchConfig.load(tmp_path)
+    assert config.protect_running_branches == []
+    assert config.protect_grace("main") is None
+
+
+def test_protect_grace_glob_match() -> None:
+    grace = 300
+    config = BranchConfig.loads(
+        f'[[protect_running_branches]]\nmatch = "release-*"\ngrace_seconds = {grace}\n'
+    )
+    assert config.protect_grace("release-1") == grace
+    assert config.protect_grace("main") is None
+
+
+def test_protect_grace_first_rule_wins() -> None:
+    first, second = 60, 600
+    config = BranchConfig.loads(
+        "[[protect_running_branches]]\n"
+        f'match = "main"\ngrace_seconds = {first}\n'
+        "[[protect_running_branches]]\n"
+        f'match = "*"\ngrace_seconds = {second}\n'
+    )
+    assert config.protect_grace("main") == first
+    assert config.protect_grace("production") == second
+
+
+def test_protect_running_branches_invalid_falls_back_to_defaults() -> None:
+    for rule in (
+        'match = "main"\ngrace_seconds = -1\n',
+        'match = "main"\ngrace_seconds = "soon"\n',
+        'match = "main"\n',
+    ):
+        config = BranchConfig.loads(
+            f'attribute = "hydraJobs"\n[[protect_running_branches]]\n{rule}'
+        )
+        # Falls back to defaults on invalid config.
+        assert config == BranchConfig()
+        assert config.protect_grace("main") is None
+
+
 # The rules cms ships: pull requests build the fast set, `production`
 # builds the full set under its own attribute, everything else builds
 # `checks`.

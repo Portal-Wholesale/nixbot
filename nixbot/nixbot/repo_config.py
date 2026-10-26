@@ -7,7 +7,7 @@ import tomllib
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Literal, Self
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, NonNegativeInt, ValidationError
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -40,6 +40,13 @@ class AttributeBranchRule(BaseModel):
     events: list[AttributeEvent] = ["push", "pull_request"]
 
 
+class ProtectRunningRule(BaseModel):
+    # Branch glob, tested against the pushed branch.
+    match: str
+    # How long a build runs before newer pushes stop superseding it.
+    grace_seconds: NonNegativeInt
+
+
 class BranchConfig(BaseModel):
     flake_dir: str = "."
     lock_file: str = "flake.lock"
@@ -47,6 +54,10 @@ class BranchConfig(BaseModel):
     # Per-branch replacements for `attribute`. The first rule whose
     # glob and events match wins. No match means `attribute` applies.
     attribute_branches: list[AttributeBranchRule] = []
+    # Running push builds of matching branches are not superseded once
+    # they have run `grace_seconds`. The first rule whose glob matches
+    # wins.
+    protect_running_branches: list[ProtectRunningRule] = []
     effects_on_pull_requests: bool = False
     effects_branches: list[str] = []
     # Branch globs whose pushes build, replacing the globally
@@ -64,6 +75,14 @@ class BranchConfig(BaseModel):
             if event in rule.events and fnmatch(branch, rule.match):
                 return rule.attribute
         return self.attribute
+
+    def protect_grace(self, branch: str) -> int | None:
+        """Seconds after which a push build of `branch` is no longer
+        superseded. None means it always is."""
+        for rule in self.protect_running_branches:
+            if fnmatch(branch, rule.match):
+                return rule.grace_seconds
+        return None
 
     @classmethod
     def loads(cls, text: str | None) -> Self:

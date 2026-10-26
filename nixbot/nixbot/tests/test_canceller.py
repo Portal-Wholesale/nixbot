@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 from nixbot.canceller import (
     CancellationManager,
@@ -39,6 +40,9 @@ def reg(  # noqa: PLR0913
     *,
     attribute: str = "checks",
     stale: bool = False,
+    protect_grace: timedelta | None = None,
+    now: datetime | None = None,
+    started_at: datetime | None = None,
 ) -> tuple[str, asyncio.Event]:
     event = asyncio.Event()
     outcome = mgr.register(
@@ -50,6 +54,9 @@ def reg(  # noqa: PLR0913
         sha,
         event,
         incoming_is_ancestor_of_running=stale,
+        protect_grace=protect_grace,
+        now=now,
+        started_at=started_at,
     )
     return outcome, event
 
@@ -168,3 +175,79 @@ def test_reregister_updates_cancel_event() -> None:
     _, fresh_event = reg(mgr, 1, "tree1", "sha1")  # recovered, new event
     reg(mgr, 2, "tree2", "sha2")  # supersedes build 1
     assert fresh_event.is_set()
+
+
+T0 = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
+GRACE = timedelta(minutes=5)
+
+
+def test_protected_under_grace_supersedes() -> None:
+    mgr = CancellationManager()
+    _, old_event = reg(mgr, 1, "tree1", "sha1", now=T0)
+    outcome, _ = reg(mgr, 2, "tree2", "sha2", protect_grace=GRACE, now=T0 + GRACE / 2)
+    assert outcome == RegisterOutcome.NEW
+    assert old_event.is_set()
+    assert mgr.running_commit_for(1, "main") == "sha2"
+
+
+def test_protected_at_and_over_grace_defers() -> None:
+    for elapsed in (GRACE, GRACE * 3):
+        mgr = CancellationManager()
+        _, old_event = reg(mgr, 1, "tree1", "sha1", now=T0)
+        outcome, new_event = reg(
+            mgr, 2, "tree2", "sha2", protect_grace=GRACE, now=T0 + elapsed
+        )
+        assert outcome == RegisterOutcome.DEFERRED
+        assert not old_event.is_set()
+        assert not new_event.is_set()
+        # The protected build still owns the context.
+        assert mgr.running_commit_for(1, "main") == "sha1"
+
+
+def test_protection_keeps_duplicate_and_stale() -> None:
+    mgr = CancellationManager()
+    _, old_event = reg(mgr, 1, "tree1", "sha1", now=T0)
+    later = T0 + GRACE * 2
+    outcome, _ = reg(mgr, 1, "tree1", "sha-other", protect_grace=GRACE, now=later)
+    assert outcome == RegisterOutcome.DUPLICATE
+    outcome, _ = reg(
+        mgr, 2, "tree0", "sha0", stale=True, protect_grace=GRACE, now=later
+    )
+    assert outcome == RegisterOutcome.STALE
+    assert not old_event.is_set()
+
+
+def test_started_at_from_caller() -> None:
+    # Recovery passes the DB start time: the grace clock does not
+    # restart with the service.
+    mgr = CancellationManager()
+    reg(mgr, 1, "tree1", "sha1", started_at=T0, now=T0 + GRACE)
+    outcome, _ = reg(mgr, 2, "tree2", "sha2", protect_grace=GRACE, now=T0 + GRACE)
+    assert outcome == RegisterOutcome.DEFERRED
+
+
+def test_reregister_keeps_started_at() -> None:
+    mgr = CancellationManager()
+    reg(mgr, 1, "tree1", "sha1", now=T0)
+    # Re-registered later, with or without a start time of its own.
+    reg(mgr, 1, "tree1", "sha1", now=T0 + GRACE)
+    reg(mgr, 1, "tree1", "sha1", started_at=T0 + GRACE, now=T0 + GRACE)
+    outcome, _ = reg(mgr, 2, "tree2", "sha2", protect_grace=GRACE, now=T0 + GRACE)
+    assert outcome == RegisterOutcome.DEFERRED
+
+
+def test_branch_delete_cancels_protected_build() -> None:
+    mgr = CancellationManager()
+    _, event = reg(mgr, 1, "tree1", "sha1", context=branch_key("main"), now=T0)
+    outcome, _ = reg(
+        mgr,
+        2,
+        "tree2",
+        "sha2",
+        context=branch_key("main"),
+        protect_grace=GRACE,
+        now=T0 + GRACE,
+    )
+    assert outcome == RegisterOutcome.DEFERRED
+    assert mgr.cancel_branch(1, "main")
+    assert event.is_set()
