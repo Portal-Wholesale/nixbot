@@ -494,6 +494,7 @@ class CIService:
             pr_number=change.pr_number,
             pr_author=change.pr_author,
             base_sha=change.base_sha,
+            head_ref=change.head_ref,
             commit_message=change.commit_message,
             actor=change.actor,
             tag=change.tag,

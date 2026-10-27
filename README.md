@@ -144,10 +144,20 @@ supported options.
 glob, `attribute` the attribute to build instead, and `events` a subset of
 `"push"` and `"pull_request"` (both when omitted). The first matching rule wins;
 with no match the top-level `attribute` applies. For a pull request, `match`
-tests the base branch, not the source branch.
+tests the base branch, not the source branch. The optional `source_match` is a
+glob for the pull request's source (head) branch: a rule that sets it matches
+only pull requests whose base branch matches `match` and whose source branch
+matches `source_match`, and never a push.
 
 ```toml
 attribute = "checks"
+
+# Dependency update pull requests build the full set.
+[[attribute_branches]]
+match = "main"
+source_match = "update-*"
+attribute = "checks"
+events = ["pull_request"]
 
 [[attribute_branches]]
 match = "*"

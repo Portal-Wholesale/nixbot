@@ -383,7 +383,9 @@ class Orchestrator:
             # PR can test its own rule change.
             repo_config = RepoBranchConfig.load(worktree.path)
             attribute = repo_config.resolve_attribute(
-                event.branch, is_pull_request=event.pr_number is not None
+                event.branch,
+                is_pull_request=event.pr_number is not None,
+                head_ref=event.head_ref,
             )
             build, created = await db.get_or_create_build(
                 self.pool,

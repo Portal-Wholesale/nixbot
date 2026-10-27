@@ -152,6 +152,8 @@ class ChangeRequest:
     author_association: str | None = None
     # PR head branch lives in the base repository (not a fork).
     head_in_base_repo: bool = False
+    # PR head branch name.
+    head_ref: str | None = None
     # Tag pushes: the tag name, also in `branch` so the build gets its
     # own context. commit_sha may be an annotated tag object until the
     # service peels it.
@@ -375,6 +377,7 @@ def _parse_pr_event(  # noqa: PLR0911
         actor=_actor(forge, payload),
         author_association=pr.get("author_association"),
         head_in_base_repo=head_in_base_repo,
+        head_ref=head.get("ref"),
     )
 
 
@@ -566,6 +569,7 @@ def _parse_gitlab_mr(repo_id: str, payload: dict[str, Any]) -> WebhookEvent | No
         # fetched alongside, so merge against its ref.
         base_sha=f"refs/heads/{target_branch}" if target_branch else None,
         actor=f"gitlab:{actor}" if actor else None,
+        head_ref=attrs.get("source_branch"),
     )
 
 
