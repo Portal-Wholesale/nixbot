@@ -201,6 +201,33 @@ Effects run for every completed build on an `effects_branches` branch, so with
 protection they run after each protected build finishes, one after another,
 instead of only when a build happens to escape supersede.
 
+A `[[fail_fast_branches]]` rule stops a push build after its first failed
+attribute, for branches where one failure already means the build will not be
+promoted. That frees evaluation and build slots sooner and reports the failure
+right away. `match` is a branch glob and `mode` decides what still runs; the
+first matching rule wins.
+
+```toml
+[[fail_fast_branches]]
+match = "main"
+mode = "cancel"
+```
+
+| Mode     | Evaluation | Attributes waiting for a slot | Attributes already building |
+| -------- | ---------- | ----------------------------- | --------------------------- |
+| `cancel` | stopped    | cancelled                     | killed and cancelled        |
+| `drain`  | stopped    | cancelled                     | finish and report           |
+
+A stop is triggered by an attribute that ends `failed`, `failed_eval` or
+`cached_failure`; an ignored failure, a post-build step failure or a dependency
+failure does not trigger one. The build ends **failed**. Attributes the
+evaluation had not reached yet get no row. Every stopped attribute is
+`cancelled` with the error `stopped: fail-fast after <attr>`, and the build
+summary names that attribute. Rules apply to push events only and are read from
+the pushed branch's own `nixbot.toml`. Pull requests and tags are unaffected,
+and restarting a build or rebuilding its failed attributes always runs
+everything.
+
 By default, effects only run on the default branch. The `build_branches`,
 `effects_branches` and `effects_on_pull_requests` settings are always read from
 the **default branch's** `nixbot.toml` (via `git show`) so that pull request
