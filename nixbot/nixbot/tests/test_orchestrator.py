@@ -18,6 +18,7 @@ from nixbot_effects import EffectError, EventEffectMeta
 
 from nixbot import build_run as build_run_mod
 from nixbot import db
+from nixbot.bootstrap import slot_scheduler
 from nixbot.build_scheduler import (
     AttributeResult,
     AttributeStatus,
@@ -28,7 +29,14 @@ from nixbot.db import BuildStatus
 from nixbot.db_gen import builds as builds_q
 from nixbot.effects import EffectMeta, EffectsContext
 from nixbot.events import BuildResult, ChangeEvent, EvalReport, RepoInfo
-from nixbot.executor import SlotKey, attribute_log_path, effect_run_log_path
+from nixbot.executor import (
+    FairPriorityScheduler,
+    FairScheduler,
+    PrioritySemaphore,
+    SlotKey,
+    attribute_log_path,
+    effect_run_log_path,
+)
 from nixbot.gcroots import GcrootRegistrationError
 from nixbot.gitrepo import FetchCredentials, RepoManager
 from nixbot.memory import EvalWorkerConfig
@@ -1207,6 +1215,32 @@ async def test_build_waiting_for_eval_slot_stays_pending(
     block.set()
     await asyncio.wait_for(tasks[0], timeout=10)
     assert eval_runner.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("build_priority", "scheduler", "eval_slots"),
+    [
+        # No setting: scheduling is exactly what it was.
+        (None, FairScheduler, asyncio.Semaphore),
+        (
+            BuildPriorityConfig(reserved_slots=1),
+            FairPriorityScheduler,
+            PrioritySemaphore,
+        ),
+    ],
+)
+async def test_build_priority_selects_slot_classes(
+    pool: asyncpg.Pool,
+    tmp_path: Path,
+    build_priority: BuildPriorityConfig | None,
+    scheduler: type,
+    eval_slots: type,
+) -> None:
+    orchestrator, _ = make_orchestrator(
+        pool, tmp_path, FakeEvalRunner([]), FakeExecutor(), build_priority
+    )
+    assert type(slot_scheduler(orchestrator.config)) is scheduler
+    assert type(orchestrator.eval_slots) is eval_slots
 
 
 async def test_eval_slot_goes_to_higher_priority_build(
