@@ -22,6 +22,7 @@ from .build_scheduler import (
     AttributeResult,
     AttributeStatus,
     BuildOutcome,
+    FailFastStop,
     JobScheduler,
     outcome_status,
 )
@@ -40,7 +41,7 @@ from .store_token import store_token_file
 from .workload_identity import identity_from_event
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
     from pathlib import Path
 
     import asyncpg
@@ -51,7 +52,7 @@ if TYPE_CHECKING:
     from .gitrepo import FetchCredentials
     from .models import NixEvalJob
     from .orchestrator import Orchestrator
-    from .repo_config import BranchConfig
+    from .repo_config import BranchConfig, FailFastMode
 
 logger = logging.getLogger(__name__)
 
@@ -150,13 +151,17 @@ async def run_build(  # noqa: PLR0913
     worktree_path: Path,
     branch_config: BranchConfig,
     credentials: FetchCredentials | None = None,
+    *,
+    fail_fast: FailFastMode | None = None,
 ) -> None:
     """Evaluate and build. Every attribute completion is one
     transactional DB write, then the result is re-aggregated.
-    `branch_config` carries the build's stored attribute."""
+    `branch_config` carries the build's stored attribute. With
+    `fail_fast`, the first failed attribute stops the build."""
+    stop = None if fail_fast is None else FailFastStop(fail_fast)
     try:
         await _run_build_inner(
-            o, event, build, worktree_path, branch_config, credentials
+            o, event, build, worktree_path, branch_config, credentials, stop
         )
     except Exception as e:
         # Catch-all: a DB outage or GitError mid-eval would
@@ -336,17 +341,22 @@ async def _evaluate(  # noqa: PLR0913
 
     async def record_job_batch(jobs: list[NixEvalJob]) -> None:
         # Pending rows appear in the UI while the eval is running.
-        await record_attributes(
-            o.pool,
-            build.id_,
-            [
-                job
-                for job in jobs
-                if isinstance(job, NixEvalJobSuccess)
-                and job.system in o.config.build_systems
-            ],
-        )
-        await jobs_queue.put(jobs)
+        try:
+            await record_attributes(
+                o.pool,
+                build.id_,
+                [
+                    job
+                    for job in jobs
+                    if isinstance(job, NixEvalJobSuccess)
+                    and job.system in o.config.build_systems
+                ],
+            )
+        finally:
+            # Queued even when a fail-fast stop cancels the eval
+            # mid-write: the scheduler settles the batch, so no recorded
+            # row stays pending.
+            jobs_queue.put_nowait(jobs)
 
     # DB writes are throttled since retry storms emit one line per
     # narinfo.
@@ -414,12 +424,13 @@ async def _run_build_inner(  # noqa: PLR0913
     worktree_path: Path,
     branch_config: BranchConfig,
     credentials: FetchCredentials | None,
+    stop: FailFastStop | None,
 ) -> None:
     await o.reporter.build_started(event, build)
     # Reruns enter with a terminal row. Stay pending until a slot is held.
     await db.set_build_status(o.pool, build.id_, BuildStatus.PENDING)
 
-    if await _try_reuse_eval(o, event, build, worktree_path, credentials):
+    if await _try_reuse_eval(o, event, build, worktree_path, credentials, stop):
         return
 
     jobs_queue: asyncio.Queue[list[NixEvalJob] | None] = asyncio.Queue()
@@ -442,20 +453,37 @@ async def _run_build_inner(  # noqa: PLR0913
     # Builds start as soon as the first eval batch arrives.
     build_task = asyncio.create_task(
         build_attributes(
-            o, event, build, worktree_path, jobs_queue, credentials=credentials
+            o,
+            event,
+            build,
+            worktree_path,
+            jobs_queue,
+            credentials=credentials,
+            fail_fast=stop,
         )
     )
     cancel_wait = asyncio.ensure_future(cancel_event.wait())
+    waits: set[asyncio.Future[Any]] = {eval_task, cancel_wait}
+    # A fail-fast stop also ends the eval, but the build finishes as
+    # failed rather than cancelled, so it gets its own wait.
+    stop_wait = None if stop is None else asyncio.ensure_future(stop.stop_queued.wait())
+    if stop_wait is not None:
+        waits.add(stop_wait)
     try:
         try:
-            await asyncio.wait(
-                {eval_task, cancel_wait}, return_when=asyncio.FIRST_COMPLETED
-            )
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
         finally:
             cancel_wait.cancel()
+            if stop_wait is not None:
+                stop_wait.cancel()
         if cancel_event.is_set() and not eval_task.done():
             await _reap(eval_task, build_task)
             await _settle_aborted(o, event, build, BuildStatus.CANCELLED)
+            return
+        if stop is not None and stop.fired and not eval_task.done():
+            await _stop_eval(
+                o, event, build, eval_task, build_task, jobs_queue, live_warnings
+            )
             return
         # EvalError and anything else propagate to run_build,
         # which settles the build as failed. Flush warnings dropped
@@ -463,10 +491,7 @@ async def _run_build_inner(  # noqa: PLR0913
         try:
             eval_result = await eval_task
         finally:
-            if live_warnings:
-                await q.set_eval_warnings(
-                    o.pool, id_=build.id_, warnings=json.dumps(live_warnings.snapshot())
-                )
+            await _flush_eval_warnings(o, build, live_warnings)
         await db.set_build_status(o.pool, build.id_, BuildStatus.BUILDING)
         await _record_eval_success(o, event, build, eval_result, live_warnings)
 
@@ -482,6 +507,37 @@ async def _run_build_inner(  # noqa: PLR0913
         # build (nix_eval kills the evaluator on cancellation).
         await _reap(eval_task, build_task)
         raise
+
+
+async def _flush_eval_warnings(
+    o: Orchestrator, build: BuildRecord, live_warnings: LiveWarningAggregator
+) -> None:
+    """Write the warnings the throttle has not flushed yet."""
+    if live_warnings:
+        await q.set_eval_warnings(
+            o.pool, id_=build.id_, warnings=json.dumps(live_warnings.snapshot())
+        )
+
+
+async def _stop_eval(  # noqa: PLR0913
+    o: Orchestrator,
+    event: ChangeEvent,
+    build: BuildRecord,
+    eval_task: asyncio.Future[EvalResult],
+    build_task: asyncio.Task[str],
+    jobs_queue: asyncio.Queue[list[NixEvalJob] | None],
+    live_warnings: LiveWarningAggregator,
+) -> None:
+    """A fail-fast stop during the eval: kill the evaluator and free
+    its slot, then let the attribute builds settle. Unevaluated
+    attributes get no row; the failed one makes the build FAILED. Not
+    an eval error, so no eval failure handling."""
+    await _reap(eval_task)
+    await _flush_eval_warnings(o, build, live_warnings)
+    await o.reporter.eval_cancelled(event, build)
+    await db.set_build_status(o.pool, build.id_, BuildStatus.BUILDING)
+    await jobs_queue.put(None)
+    await build_task
 
 
 async def _reusable_eval_jobs(
@@ -516,12 +572,13 @@ async def _reusable_eval_jobs(
     return jobs
 
 
-async def _try_reuse_eval(
+async def _try_reuse_eval(  # noqa: PLR0913
     o: Orchestrator,
     event: ChangeEvent,
     build: BuildRecord,
     worktree_path: Path,
     credentials: FetchCredentials | None,
+    stop: FailFastStop | None,
 ) -> bool:
     """Skip nix-eval-jobs and build from a reused eval result; False
     when a fresh evaluation is needed."""
@@ -540,6 +597,7 @@ async def _try_reuse_eval(
         reused,
         credentials=credentials,
         cache_failures=False,
+        fail_fast=stop,
     )
     return True
 
@@ -553,11 +611,13 @@ async def build_attributes(  # noqa: PLR0913
     *,
     credentials: FetchCredentials | None,
     cache_failures: bool = True,
+    fail_fast: FailFastStop | None = None,
 ) -> str:
     """Schedule the attribute builds, persist their results, and
     re-aggregate the build (shared by fresh builds and reruns).
     Accepts either a complete job list or a queue fed during an
-    ongoing evaluation. Returns the aggregated build status."""
+    ongoing evaluation. Returns the aggregated build status. Reruns
+    and recovery pass no `fail_fast`: they want full results."""
     cancel_event = o.cancel_events.setdefault(build.id_, asyncio.Event())
 
     async def record_early(result: AttributeResult) -> None:
@@ -573,11 +633,14 @@ async def build_attributes(  # noqa: PLR0913
     if failed_build_cache is not None and not cache_failures:
         failed_build_cache = _ReadOnlyFailedBuildCache(failed_build_cache)
     scheduler = JobScheduler(
-        _OrchestratorExecutor(o, event, build, worktree_path, cancel_event),
+        _OrchestratorExecutor(
+            o, event, build, worktree_path, cancel_event, fail_fast=fail_fast
+        ),
         o.config.build_systems,
         failed_build_cache=failed_build_cache,
         build_url=f"{o.config.url}/repos/{event.repo.forge}/{event.repo.name}/builds/{build.number}",
         on_result=record_early,
+        fail_fast=fail_fast,
     )
     if isinstance(jobs, asyncio.Queue):
         schedule_result = await scheduler.run_incremental(jobs)
@@ -655,19 +718,22 @@ class _OrchestratorExecutor:
     steps, gcroots, outputs, and writes the attribute completion as one
     transactional write."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         orchestrator: Orchestrator,
         event: ChangeEvent,
         build: BuildRecord,
         worktree_path: Path,
         cancel_event: asyncio.Event,
+        *,
+        fail_fast: FailFastStop | None = None,
     ) -> None:
         self.o = orchestrator
         self.event = event
         self.build_record = build
         self.worktree_path = worktree_path
         self.cancel_event = cancel_event
+        self.fail_fast = fail_fast
 
     async def build(self, job: NixEvalJobSuccess) -> BuildOutcome:
         try:
@@ -722,6 +788,30 @@ class _OrchestratorExecutor:
             return BuildOutcome.post_build_failure
         return BuildOutcome.success
 
+    @contextlib.contextmanager
+    def _attr_cancel(self, job: NixEvalJobSuccess) -> Iterator[asyncio.Event]:
+        """Per-attribute cancellation: the executor watches one event, so
+        mirror the build-level cancel, and a fail-fast stop of running
+        builds, into the attribute's own event."""
+        attr_cancel = asyncio.Event()
+        key = (self.build_record.id_, job.attr)
+        self.o.attr_cancel_events[key] = attr_cancel
+
+        async def _mirror(source: asyncio.Event) -> None:
+            await source.wait()
+            attr_cancel.set()
+
+        sources = [self.cancel_event]
+        if self.fail_fast is not None:
+            sources.append(self.fail_fast.stop_running)
+        mirrors = [asyncio.create_task(_mirror(source)) for source in sources]
+        try:
+            yield attr_cancel
+        finally:
+            for mirror in mirrors:
+                mirror.cancel()
+            self.o.attr_cancel_events.pop(key, None)
+
     async def _build_inner(self, job: NixEvalJobSuccess) -> BuildOutcome:
         # Runs after slot acquisition so started_at (and the shown
         # duration) excludes queue wait. False: row already terminal.
@@ -735,21 +825,12 @@ class _OrchestratorExecutor:
             )
             return marked is not None
 
-        # Per-attribute cancellation: the executor watches one event, so
-        # mirror the build-level cancel into the attribute's own event.
-        attr_cancel = asyncio.Event()
-        self.o.attr_cancel_events[(self.build_record.id_, job.attr)] = attr_cancel
-
-        async def _mirror_build_cancel() -> None:
-            await self.cancel_event.wait()
-            attr_cancel.set()
-
         def on_built(drv: str) -> None:
             for uploader in self.o.uploaders:
                 uploader.enqueue_nowait(drv)
 
-        mirror = asyncio.create_task(_mirror_build_cancel())
-        try:
+        stop = self.fail_fast
+        with self._attr_cancel(job) as attr_cancel:
             async with self.o.open_log(self.build_record.id_, job.attr) as writer:
                 outcome = await self.o.executor.build_attribute(
                     self.build_record.id_,
@@ -762,14 +843,14 @@ class _OrchestratorExecutor:
                     identity=identity_from_event(
                         self.event, "build", self.build_record.id_
                     ),
+                    stop_queued=None if stop is None else stop.stop_queued,
                 )
                 if outcome == BuildOutcome.success:
                     outcome = await self._after_success(job, writer)
-        finally:
-            mirror.cancel()
-            self.o.attr_cancel_events.pop((self.build_record.id_, job.attr), None)
 
         status, error = outcome_status(job, outcome)
+        if status == AttributeStatus.cancelled and stop is not None and stop.fired:
+            error = stop.reason
         # Failed attributes carry a log-tail excerpt so the build page
         # answers "why" without a click into the log. ANSI stays: the
         # web layer renders it, the API strips it.
