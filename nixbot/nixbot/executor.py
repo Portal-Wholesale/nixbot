@@ -203,6 +203,132 @@ class FairScheduler:
                 future.set_result(None)
 
 
+def slot_priority(key: object) -> int:
+    """Configured priority of a waiter key; plain keys are 0."""
+    return key.priority if isinstance(key, SlotKey) else 0
+
+
+def aged_priority(priority: int, waited: float, age_step_seconds: int) -> int:
+    """+1 per `age_step_seconds` waited, so low priorities are delayed
+    but never starved. A step of 0 disables ageing."""
+    if age_step_seconds <= 0:
+        return priority
+    return priority + int(waited // age_step_seconds)
+
+
+@dataclass
+class _SlotWaiter:
+    future: asyncio.Future[None]
+    since: float
+
+
+class FairPriorityScheduler:
+    """FairScheduler with priority classes. The next free slot goes to
+    the highest effective priority class with waiters, round-robin
+    across keys within it and FIFO within a key. A key's effective
+    priority is its SlotKey priority plus ageing of its oldest waiter.
+
+    The last `reserved_slots` slots go only to keys whose configured
+    priority is above 0. Ageing does not count, so a backlog of
+    priority-0 builds can never fill them. Nothing is preempted."""
+
+    def __init__(
+        self,
+        capacity: int,
+        *,
+        reserved_slots: int = 0,
+        age_step_seconds: int = 0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if capacity < 1:
+            msg = f"capacity must be >= 1, got {capacity}"
+            raise ValueError(msg)
+        if not 0 <= reserved_slots < capacity:
+            msg = (
+                f"reserved_slots must be in [0, capacity={capacity}), "
+                f"got {reserved_slots}"
+            )
+            raise ValueError(msg)
+        self.capacity = capacity
+        self.reserved_slots = reserved_slots
+        self.age_step_seconds = age_step_seconds
+        self._clock = clock
+        self._active = 0
+        # key -> FIFO of waiters. A key is in _rotation exactly while it
+        # has waiters; its position there is its round-robin turn.
+        self._waiters: dict[object, deque[_SlotWaiter]] = {}
+        self._rotation: deque[object] = deque()
+
+    def _limit(self, priority: int) -> int:
+        return self.capacity if priority > 0 else self.capacity - self.reserved_slots
+
+    async def acquire(self, key: object) -> None:
+        if not self._waiters and self._active < self._limit(slot_priority(key)):
+            self._active += 1
+            return
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        if key not in self._waiters:
+            self._waiters[key] = deque()
+            self._rotation.append(key)
+        self._waiters[key].append(_SlotWaiter(future, self._clock()))
+        # Waiters may sit below capacity, held back by the reservation:
+        # a key allowed a reserved slot takes it now.
+        self._dispatch()
+        try:
+            await future
+        except asyncio.CancelledError:
+            queue = self._waiters.get(key)
+            waiter = next((w for w in queue or () if w.future is future), None)
+            if queue is not None and waiter is not None:
+                queue.remove(waiter)
+                if not queue:
+                    del self._waiters[key]
+                    self._rotation.remove(key)
+            if future.cancelled() or not future.done():
+                raise
+            # Granted concurrently with cancellation: give the slot back.
+            self.release()
+            raise
+
+    def release(self) -> None:
+        self._active -= 1
+        self._dispatch()
+
+    def _next_key(self) -> object | None:
+        """First key in rotation order of the highest effective class
+        that may take the next slot."""
+        reserved_only = self._active >= self._limit(0)
+        now = self._clock()
+        best: object | None = None
+        best_priority = 0
+        for key in self._rotation:
+            priority = slot_priority(key)
+            if reserved_only and priority <= 0:
+                continue
+            waited = now - self._waiters[key][0].since
+            effective = aged_priority(priority, waited, self.age_step_seconds)
+            if best is None or effective > best_priority:
+                best, best_priority = key, effective
+        return best
+
+    def _dispatch(self) -> None:
+        while self._active < self.capacity:
+            key = self._next_key()
+            if key is None:
+                return
+            queue = self._waiters[key]
+            waiter = queue.popleft()
+            # Rotate: the key's next grant waits for the rest of its class.
+            self._rotation.remove(key)
+            if queue:
+                self._rotation.append(key)
+            else:
+                del self._waiters[key]
+            if not waiter.future.done():
+                self._active += 1
+                waiter.future.set_result(None)
+
+
 @dataclass
 class LogWriter:
     """Frame-chunked zstd log writer with subscriber fan-out and a size

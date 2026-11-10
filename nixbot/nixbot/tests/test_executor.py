@@ -24,9 +24,12 @@ from nixbot.executor import (
     STRUCTURED_QUEUE_MAXSIZE,
     SUBSCRIBER_QUEUE_MAXSIZE,
     BuildSettings,
+    FairPriorityScheduler,
     FairScheduler,
     LogWriter,
     NixBuildExecutor,
+    SlotKey,
+    SlotScheduler,
     StructuredCapture,
     build_nix_command,
     failure_excerpt,
@@ -41,14 +44,25 @@ from .support import mk_job
 from .test_workload_identity import decode, make_issuer, push_identity
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
 # --- FairScheduler ---------------------------------------------------------
 
+type MakeScheduler = Callable[[int], SlotScheduler]
 
-async def test_fair_round_robin_across_builds() -> None:
-    queue = FairScheduler(1)
+
+@pytest.fixture(params=[FairScheduler, FairPriorityScheduler])
+def make_scheduler(request: pytest.FixtureRequest) -> MakeScheduler:
+    """Both slot schedulers. With every key at priority 0 (plain keys
+    are), FairPriorityScheduler must schedule exactly like
+    FairScheduler."""
+    return request.param
+
+
+async def test_fair_round_robin_across_builds(make_scheduler: MakeScheduler) -> None:
+    queue = make_scheduler(1)
     order: list[str] = []
     await queue.acquire("seed")  # occupy the only slot
 
@@ -72,8 +86,8 @@ async def test_fair_round_robin_across_builds() -> None:
     assert order == ["a1", "b1", "a2", "b2", "a3"]
 
 
-async def test_fair_scheduler_capacity() -> None:
-    queue = FairScheduler(2)
+async def test_fair_scheduler_capacity(make_scheduler: MakeScheduler) -> None:
+    queue = make_scheduler(2)
     active = 0
     peak = 0
 
@@ -91,8 +105,8 @@ async def test_fair_scheduler_capacity() -> None:
     assert peak == 2
 
 
-async def test_fair_scheduler_cancelled_waiter() -> None:
-    queue = FairScheduler(1)
+async def test_fair_scheduler_cancelled_waiter(make_scheduler: MakeScheduler) -> None:
+    queue = make_scheduler(1)
     await queue.acquire("A")
     waiter = asyncio.create_task(queue.acquire("B"))
     await asyncio.sleep(0)
@@ -102,6 +116,159 @@ async def test_fair_scheduler_cancelled_waiter() -> None:
     queue.release()
     # Slot must be available again.
     await asyncio.wait_for(queue.acquire("C"), timeout=1)
+
+
+async def test_fair_scheduler_cancelled_at_grant(make_scheduler: MakeScheduler) -> None:
+    queue = make_scheduler(1)
+    await queue.acquire("A")
+    waiter = asyncio.create_task(queue.acquire("B"))
+    await asyncio.sleep(0)
+    # Granted and cancelled in the same turn: the slot goes back.
+    queue.release()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    await asyncio.wait_for(queue.acquire("C"), timeout=1)
+
+
+# --- FairPriorityScheduler -------------------------------------------------
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+async def drain_order(
+    queue: SlotScheduler, waiters: list[tuple[str, object]]
+) -> list[str]:
+    """Enqueue `waiters` (name, key) in order behind a held slot, free
+    it, and return the order they got their slots in."""
+    order: list[str] = []
+    await queue.acquire(SlotKey(0, 100))  # occupy the only slot
+
+    async def worker(name: str, key: object) -> None:
+        await queue.acquire(key)
+        order.append(name)
+        queue.release()
+
+    tasks = [asyncio.create_task(worker(name, key)) for name, key in waiters]
+    await asyncio.sleep(0)  # let all enqueue
+    queue.release()
+    await asyncio.gather(*tasks)
+    return order
+
+
+async def test_priority_higher_class_first() -> None:
+    low, high = SlotKey(1), SlotKey(2, priority=5)
+    order = await drain_order(
+        FairPriorityScheduler(1),
+        [("l1", low), ("l2", low), ("h1", high), ("h2", high)],
+    )
+    assert order == ["h1", "h2", "l1", "l2"]
+
+
+async def test_priority_round_robin_within_class() -> None:
+    a, b, low = SlotKey(1, priority=5), SlotKey(2, priority=5), SlotKey(3)
+    order = await drain_order(
+        FairPriorityScheduler(1),
+        [("l1", low), ("a1", a), ("a2", a), ("b1", b), ("b2", b)],
+    )
+    assert order == ["a1", "b1", "a2", "b2", "l1"]
+
+
+@pytest.mark.parametrize(
+    ("waited", "expected"),
+    [
+        # Two steps: the low key's effective priority 2 beats 1.
+        (25.0, ["l1", "h1"]),
+        # Not a full step yet: still priority 0.
+        (5.0, ["h1", "l1"]),
+    ],
+)
+async def test_priority_ageing_promotes_waiting_key(
+    waited: float, expected: list[str]
+) -> None:
+    clock = FakeClock()
+    queue = FairPriorityScheduler(1, age_step_seconds=10, clock=clock)
+    order: list[str] = []
+    await queue.acquire(SlotKey(0))
+
+    async def worker(name: str, key: SlotKey) -> None:
+        await queue.acquire(key)
+        order.append(name)
+        queue.release()
+
+    low = asyncio.create_task(worker("l1", SlotKey(1)))
+    await asyncio.sleep(0)
+    clock.now = waited
+    high = asyncio.create_task(worker("h1", SlotKey(2, priority=1)))
+    await asyncio.sleep(0)
+    queue.release()
+    await asyncio.gather(low, high)
+    assert order == expected
+
+
+async def test_priority_reserved_slots_refused_to_priority_zero() -> None:
+    clock = FakeClock()
+    queue = FairPriorityScheduler(2, reserved_slots=1, age_step_seconds=1, clock=clock)
+    await queue.acquire(SlotKey(1))
+    # Nobody waits, but the free slot is reserved: the fast path must
+    # not hand it to priority 0.
+    low = asyncio.create_task(queue.acquire(SlotKey(2)))
+    await asyncio.sleep(0)
+    assert not low.done()
+    # Aged far past priority 1, the waiter still cannot take the
+    # reserved slot; a configured priority above 0 can.
+    clock.now = 1000
+    await asyncio.wait_for(queue.acquire(SlotKey(3, priority=1)), timeout=1)
+    assert not low.done()
+    queue.release()
+    await asyncio.sleep(0)
+    assert not low.done()  # only the reserved slot is free
+    queue.release()
+    await asyncio.wait_for(low, timeout=1)
+
+
+async def test_priority_cancelled_waiter_hands_slot_to_next_class() -> None:
+    queue = FairPriorityScheduler(1)
+    await queue.acquire(SlotKey(1))
+    high = asyncio.create_task(queue.acquire(SlotKey(2, priority=5)))
+    low = asyncio.create_task(queue.acquire(SlotKey(3)))
+    await asyncio.sleep(0)
+    high.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await high
+    queue.release()
+    await asyncio.wait_for(low, timeout=1)
+
+
+async def test_priority_cancelled_at_grant_returns_reserved_slot() -> None:
+    queue = FairPriorityScheduler(2, reserved_slots=1)
+    await queue.acquire(SlotKey(1))
+    await queue.acquire(SlotKey(2, priority=5))
+    high = asyncio.create_task(queue.acquire(SlotKey(3, priority=5)))
+    await asyncio.sleep(0)
+    queue.release()  # grants `high`
+    high.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await high
+    # The returned slot is the reserved one: still priority > 0 only.
+    low = asyncio.create_task(queue.acquire(SlotKey(4)))
+    await asyncio.sleep(0)
+    assert not low.done()
+    await asyncio.wait_for(queue.acquire(SlotKey(5, priority=1)), timeout=1)
+    low.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await low
+
+
+def test_priority_scheduler_rejects_reserving_every_slot() -> None:
+    with pytest.raises(ValueError, match="reserved_slots"):
+        FairPriorityScheduler(2, reserved_slots=2)
 
 
 # --- LogWriter --------------------------------------------------------------
@@ -508,11 +675,13 @@ async def test_executor_sanitizes_out_link(tmp_path: Path, fake_nix: Path) -> No
     assert b"--out-link " + str(tmp_path).encode() + b"/result-checks." in log
 
 
-async def test_executor_cancel_while_queued(tmp_path: Path, fake_nix: Path) -> None:
+async def test_executor_cancel_while_queued(
+    tmp_path: Path, fake_nix: Path, make_scheduler: MakeScheduler
+) -> None:
     # A queued build whose cancel event fires must not wait for a slot.
     fake_nix.write_text("hang")
 
-    queue = FairScheduler(1)
+    queue = make_scheduler(1)
     executor = NixBuildExecutor(queue, BuildSettings(log_dir=tmp_path))
     blocker_writer = LogWriter(path=tmp_path / "blocker.zst")
     blocker = asyncio.create_task(
@@ -577,13 +746,13 @@ async def test_executor_finished_build_wins_cancel_race(
 
 
 async def test_executor_task_cancelled_while_queued_releases_waiter(
-    tmp_path: Path, fake_nix: Path
+    tmp_path: Path, fake_nix: Path, make_scheduler: MakeScheduler
 ) -> None:
     # Cancelling the coroutine itself while it waits for a slot must
     # withdraw the waiter: a later grant must not leak a slot.
     fake_nix.write_text("hang")
 
-    queue = FairScheduler(1)
+    queue = make_scheduler(1)
     executor = NixBuildExecutor(queue, BuildSettings(log_dir=tmp_path))
     await queue.acquire("seed")  # occupy the only slot
     writer = LogWriter(path=tmp_path / "log.zst")
