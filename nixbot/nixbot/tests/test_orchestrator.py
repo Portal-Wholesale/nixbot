@@ -18,17 +18,25 @@ from nixbot_effects import EffectError, EventEffectMeta
 
 from nixbot import build_run as build_run_mod
 from nixbot import db
+from nixbot.bootstrap import slot_scheduler
 from nixbot.build_scheduler import (
     AttributeResult,
     AttributeStatus,
     BuildOutcome,
 )
-from nixbot.config import Config
+from nixbot.config import BuildPriorityConfig, Config, PriorityRule
 from nixbot.db import BuildStatus
 from nixbot.db_gen import builds as builds_q
 from nixbot.effects import EffectMeta, EffectsContext
 from nixbot.events import BuildResult, ChangeEvent, EvalReport, RepoInfo
-from nixbot.executor import attribute_log_path, effect_run_log_path
+from nixbot.executor import (
+    FairPriorityScheduler,
+    FairScheduler,
+    PrioritySemaphore,
+    SlotKey,
+    attribute_log_path,
+    effect_run_log_path,
+)
 from nixbot.gcroots import GcrootRegistrationError
 from nixbot.gitrepo import FetchCredentials, RepoManager
 from nixbot.memory import EvalWorkerConfig
@@ -123,6 +131,7 @@ class FakeExecutor:
     # When set, builds wait on this gate (for in-flight tests).
     gate: asyncio.Event | None = None
     started: asyncio.Event = field(default_factory=asyncio.Event)
+    build_keys: list[object] = field(default_factory=list)
 
     async def build_attribute(  # noqa: PLR0913
         self,
@@ -136,6 +145,7 @@ class FakeExecutor:
         identity: EffectIdentity | None = None,
         stop_queued: asyncio.Event | None = None,
     ) -> BuildOutcome:
+        self.build_keys.append(build_key)
         if on_start is not None and not await on_start():
             return BuildOutcome.cancelled
         self.built.append(job.attr)
@@ -244,12 +254,14 @@ def make_orchestrator(
     tmp_path: Path,
     eval_runner: EvalRunnerLike,
     executor: AttributeExecutor,
+    build_priority: BuildPriorityConfig | None = None,
 ) -> tuple[Orchestrator, RecordingReporter]:
     config = Config(
         db_url="unused",
         build_systems=["x86_64-linux"],
         url="https://ci.test",
         state_dir=tmp_path / "state",
+        build_priority=build_priority,
     )
     reporter = RecordingReporter()
     registered: list[tuple[Path, str, str, str]] = []
@@ -668,6 +680,24 @@ async def test_pr_source_branch_selects_attribute(
     assert build is not None
     assert build.attribute == "checks"
     assert eval_runner.attributes == ["checks"]
+
+
+async def test_attribute_slot_key_carries_build_priority(
+    make_env: EnvFactory, upstream: Path
+) -> None:
+    executor = FakeExecutor()
+    orchestrator, _, project = await make_env(
+        FakeEvalRunner([mk_job("a")]), executor, name="slot-key"
+    )
+    rule = PriorityRule(match="main", events=["push"], priority=10)
+    orchestrator.config.build_priority = BuildPriorityConfig(rules=[rule])
+    build = await orchestrator.handle_change_event(
+        ChangeEvent(
+            repo=project, branch="main", commit_sha=git(upstream, "rev-parse", "HEAD")
+        )
+    )
+    assert build is not None
+    assert executor.build_keys == [SlotKey(build.id_, rule.priority)]
 
 
 async def test_same_tree_and_attribute_share_one_build(
@@ -1185,6 +1215,82 @@ async def test_build_waiting_for_eval_slot_stays_pending(
     block.set()
     await asyncio.wait_for(tasks[0], timeout=10)
     assert eval_runner.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("build_priority", "scheduler", "eval_slots"),
+    [
+        # No setting: scheduling is exactly what it was.
+        (None, FairScheduler, asyncio.Semaphore),
+        (
+            BuildPriorityConfig(reserved_slots=1),
+            FairPriorityScheduler,
+            PrioritySemaphore,
+        ),
+    ],
+)
+async def test_build_priority_selects_slot_classes(
+    pool: asyncpg.Pool,
+    tmp_path: Path,
+    build_priority: BuildPriorityConfig | None,
+    scheduler: type,
+    eval_slots: type,
+) -> None:
+    orchestrator, _ = make_orchestrator(
+        pool, tmp_path, FakeEvalRunner([]), FakeExecutor(), build_priority
+    )
+    # Explicit, so the reservation fits on a 1-CPU runner too.
+    orchestrator.config.build_concurrency = 4
+    assert type(slot_scheduler(orchestrator.config)) is scheduler
+    assert type(orchestrator.eval_slots) is eval_slots
+
+
+def test_slot_scheduler_clamps_oversized_reservation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = Config(
+        db_url="unused",
+        build_systems=["x86_64-linux"],
+        url="https://ci.test",
+        build_concurrency=2,
+        build_priority=BuildPriorityConfig(reserved_slots=5),
+    )
+    scheduler = slot_scheduler(config)
+    assert isinstance(scheduler, FairPriorityScheduler)
+    assert scheduler.reserved_slots == 1
+    assert "reserved_slots=5" in caplog.text
+
+
+async def test_eval_slot_goes_to_higher_priority_build(
+    pool: asyncpg.Pool, tmp_path: Path
+) -> None:
+    """A main push queued behind a PR eval takes the next eval slot."""
+    orchestrator, _ = make_orchestrator(
+        pool,
+        tmp_path,
+        FakeEvalRunner([]),
+        FakeExecutor(),
+        build_priority=BuildPriorityConfig(
+            rules=[PriorityRule(match="main", events=["push"], priority=10)]
+        ),
+    )
+    project = await make_project(pool, name="eval-priority")
+    pr = ChangeEvent(repo=project, branch="main", commit_sha="a" * 40, pr_number=1)
+    push = ChangeEvent(repo=project, branch="main", commit_sha="b" * 40)
+    order: list[str] = []
+
+    async def evaluate(name: str, event: ChangeEvent) -> None:
+        async with orchestrator.eval_slot(event):
+            order.append(name)
+
+    async with orchestrator.eval_slot(pr):  # the only slot
+        tasks = [
+            asyncio.create_task(evaluate("pr", pr)),
+            asyncio.create_task(evaluate("main", push)),
+        ]
+        await asyncio.sleep(0)
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=10)
+    assert order == ["main", "pr"]
 
 
 async def test_pending_attribute_rows_recorded_for_crash_recovery(

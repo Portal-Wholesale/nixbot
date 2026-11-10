@@ -36,7 +36,12 @@ from .config import (
     read_secret_file,
     resolve_credential_path,
 )
-from .executor import BuildSettings, FairScheduler, NixBuildExecutor
+from .executor import (
+    BuildSettings,
+    FairPriorityScheduler,
+    FairScheduler,
+    NixBuildExecutor,
+)
 from .failed_builds import PostgresFailedBuildCache
 from .forge import (
     GiteaClient,
@@ -86,6 +91,7 @@ if TYPE_CHECKING:
     from uvicorn._types import ASGIApplication
 
     from .config import Config
+    from .executor import SlotScheduler
 
 from .service import (
     CIService,
@@ -223,6 +229,31 @@ def _netrc_credentials(
     )
 
 
+def slot_scheduler(config: Config) -> SlotScheduler:
+    """The attribute slot pool: by build priority when configured,
+    plain round-robin across builds otherwise."""
+    capacity = config.build_concurrency or os.cpu_count() or 4
+    priority = config.build_priority
+    if priority is None:
+        return FairScheduler(capacity)
+    # Capacity is derived from the CPU count when build_concurrency is
+    # unset, so it is only known here: clamp instead of crash-looping.
+    reserved = min(priority.reserved_slots, capacity - 1)
+    if reserved != priority.reserved_slots:
+        logger.warning(
+            "build_priority.reserved_slots=%d needs more than the %d attribute "
+            "slots available; reserving %d",
+            priority.reserved_slots,
+            capacity,
+            reserved,
+        )
+    return FairPriorityScheduler(
+        capacity,
+        reserved_slots=reserved,
+        age_step_seconds=priority.age_step_seconds,
+    )
+
+
 def _forge_clients(config: Config, pool: asyncpg.Pool) -> _ForgeClients:
     clients = _ForgeClients()
     if config.github is not None:
@@ -291,7 +322,7 @@ async def build_service(config: Config) -> tuple[CIService, FastAPI]:
             ),
         )
     executor = NixBuildExecutor(
-        FairScheduler(config.build_concurrency or os.cpu_count() or 4),
+        slot_scheduler(config),
         BuildSettings(
             log_dir=config.state_dir / "logs",
             timeout=config.build_timeout,

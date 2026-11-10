@@ -26,11 +26,12 @@ from .build_scheduler import (
     JobScheduler,
     outcome_status,
 )
+from .config import priority_for
 from .db import BuildStatus
 from .db_gen import builds as q
 from .db_gen import maintenance as mq
 from .events import BuildResult, EvalReport
-from .executor import LogWriter, failure_excerpt
+from .executor import LogWriter, SlotKey, failure_excerpt
 from .flake_prefetch import PrefetchError, prefetch_flake_inputs
 from .live_warnings import LiveWarningAggregator
 from .memory import calculate_eval_workers
@@ -373,7 +374,7 @@ async def _evaluate(  # noqa: PLR0913
                 o.pool, id_=build.id_, warnings=json.dumps(live_warnings.snapshot())
             )
 
-    async with o.eval_slots:
+    async with o.eval_slot(event):
         await db.set_build_status(o.pool, build.id_, BuildStatus.EVALUATING)
         await _prefetch_inputs(o, build, worktree_path, branch_config, credentials)
         settings = _eval_settings(o, event, build, credentials)
@@ -741,6 +742,9 @@ class _OrchestratorExecutor:
         self.worktree_path = worktree_path
         self.cancel_event = cancel_event
         self.fail_fast = fail_fast
+        self.slot_key = SlotKey(
+            build.id_, priority_for(orchestrator.config.build_priority, event)
+        )
 
     async def build(self, job: NixEvalJobSuccess) -> BuildOutcome:
         try:
@@ -840,7 +844,7 @@ class _OrchestratorExecutor:
         with self._attr_cancel(job) as attr_cancel:
             async with self.o.open_log(self.build_record.id_, job.attr) as writer:
                 outcome = await self.o.executor.build_attribute(
-                    self.build_record.id_,
+                    self.slot_key,
                     job,
                     writer,
                     self.worktree_path,
