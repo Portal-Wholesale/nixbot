@@ -526,11 +526,11 @@ class JobScheduler:
                 if cancelled
                 else AttributeStatus.dependency_failed,
             )
-        # A post-build failure built the derivation, so it does not
-        # stop the build.
-        if (
-            status == AttributeStatus.failed
-            and outcome != BuildOutcome.post_build_failure
+        # A post-build failure built the derivation and an internal error
+        # says nothing about the build, so neither stops the build.
+        if status == AttributeStatus.failed and outcome not in (
+            BuildOutcome.post_build_failure,
+            BuildOutcome.failure_no_cache,
         ):
             self._trigger_fail_fast(state, job.attr)
         state.prune(job.drv_path)

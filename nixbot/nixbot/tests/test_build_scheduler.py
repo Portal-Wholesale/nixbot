@@ -682,12 +682,11 @@ def test_fail_fast_stop_modes() -> None:
     ("bad", "outcome", "cached"),
     [
         (mk_job("bad"), BuildOutcome.failure, False),
-        (mk_job("bad"), BuildOutcome.failure_no_cache, False),
         # The build succeeded although requireFailure is set.
         (_with_extra(mk_job("bad"), requireFailure=True), BuildOutcome.success, False),
         (mk_job("bad"), BuildOutcome.success, True),
     ],
-    ids=["failed", "failed-no-cache", "require-failure-succeeded", "cached-failure"],
+    ids=["failed", "require-failure-succeeded", "cached-failure"],
 )
 async def test_fail_fast_triggering_status_stops(
     bad: NixEvalJobSuccess, outcome: BuildOutcome, *, cached: bool
@@ -719,10 +718,18 @@ async def test_fail_fast_triggering_status_stops(
     [
         (_with_extra(mk_job("bad"), ignoreFailure=True), BuildOutcome.failure),
         (mk_job("bad"), BuildOutcome.post_build_failure),
+        # An internal error settles failed but is not a build failure.
+        (mk_job("bad"), BuildOutcome.failure_no_cache),
         (_with_extra(mk_job("bad"), requireFailure=True), BuildOutcome.failure),
         (mk_job("bad"), BuildOutcome.cancelled),
     ],
-    ids=["ignored-failure", "post-build-failure", "require-failure-met", "cancelled"],
+    ids=[
+        "ignored-failure",
+        "post-build-failure",
+        "internal-error",
+        "require-failure-met",
+        "cancelled",
+    ],
 )
 async def test_fail_fast_non_triggering_status_does_not_stop(
     bad: NixEvalJobSuccess, outcome: BuildOutcome

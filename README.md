@@ -219,14 +219,14 @@ mode = "cancel"
 | `drain`  | stopped    | cancelled                     | finish and report           |
 
 A stop is triggered by an attribute that ends `failed`, `failed_eval` or
-`cached_failure`; an ignored failure, a post-build step failure or a dependency
-failure does not trigger one. The build ends **failed**. Attributes the
-evaluation had not reached yet get no row. Every stopped attribute is
-`cancelled` with the error `stopped: fail-fast after <attr>`, and the build
-summary names that attribute. Rules apply to push events only and are read from
-the pushed branch's own `nixbot.toml`. Pull requests and tags are unaffected,
-and restarting a build or rebuilding its failed attributes always runs
-everything.
+`cached_failure`; an ignored failure, a post-build step failure, an internal
+error or a dependency failure does not trigger one. The build ends **failed**.
+Attributes the evaluation had not reached yet get no row. Every stopped
+attribute is `cancelled` with the error `stopped: fail-fast after <attr>`, and
+the build summary names that attribute. Rules apply to push events only and are
+read from the pushed branch's own `nixbot.toml`. Pull requests and tags are
+unaffected, and restarting a build or rebuilding its failed attributes always
+runs everything.
 
 By default, effects only run on the default branch. The `build_branches`,
 `effects_branches` and `effects_on_pull_requests` settings are always read from
