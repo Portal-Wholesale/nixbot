@@ -1239,8 +1239,26 @@ async def test_build_priority_selects_slot_classes(
     orchestrator, _ = make_orchestrator(
         pool, tmp_path, FakeEvalRunner([]), FakeExecutor(), build_priority
     )
+    # Explicit, so the reservation fits on a 1-CPU runner too.
+    orchestrator.config.build_concurrency = 4
     assert type(slot_scheduler(orchestrator.config)) is scheduler
     assert type(orchestrator.eval_slots) is eval_slots
+
+
+def test_slot_scheduler_clamps_oversized_reservation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = Config(
+        db_url="unused",
+        build_systems=["x86_64-linux"],
+        url="https://ci.test",
+        build_concurrency=2,
+        build_priority=BuildPriorityConfig(reserved_slots=5),
+    )
+    scheduler = slot_scheduler(config)
+    assert isinstance(scheduler, FairPriorityScheduler)
+    assert scheduler.reserved_slots == 1
+    assert "reserved_slots=5" in caplog.text
 
 
 async def test_eval_slot_goes_to_higher_priority_build(
