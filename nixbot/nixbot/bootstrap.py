@@ -236,9 +236,20 @@ def slot_scheduler(config: Config) -> SlotScheduler:
     priority = config.build_priority
     if priority is None:
         return FairScheduler(capacity)
+    # Capacity is derived from the CPU count when build_concurrency is
+    # unset, so it is only known here: clamp instead of crash-looping.
+    reserved = min(priority.reserved_slots, capacity - 1)
+    if reserved != priority.reserved_slots:
+        logger.warning(
+            "build_priority.reserved_slots=%d needs more than the %d attribute "
+            "slots available; reserving %d",
+            priority.reserved_slots,
+            capacity,
+            reserved,
+        )
     return FairPriorityScheduler(
         capacity,
-        reserved_slots=priority.reserved_slots,
+        reserved_slots=reserved,
         age_step_seconds=priority.age_step_seconds,
     )
 
