@@ -14,8 +14,9 @@ import os
 import re
 from collections.abc import Callable, Mapping  # noqa: TC003
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
-from typing import Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -23,10 +24,16 @@ from pydantic import (
     ConfigDict,
     Field,
     GetCoreSchemaHandler,
+    NonNegativeInt,
     field_validator,
     model_validator,
 )
 from pydantic_core import CoreSchema, core_schema
+
+from .repo_config import AttributeEvent  # noqa: TC001
+
+if TYPE_CHECKING:
+    from .events import ChangeEvent
 
 
 class ConfigError(Exception):
@@ -269,6 +276,48 @@ class PrApprovalConfig(BaseModel):
     ]
 
 
+class PriorityRule(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Glob over "forge/owner/name"; None matches every repository.
+    repo: str | None = None
+    # Branch glob. For a pull request it tests the base branch.
+    match: str
+    events: list[AttributeEvent] = ["push", "pull_request"]
+    priority: int
+
+
+class BuildPriorityConfig(BaseModel):
+    """Service-wide priority for eval and attribute slots. Higher
+    priorities take the next free slot; nothing is preempted."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # First matching rule wins; no match means priority 0.
+    rules: list[PriorityRule] = []
+    # The last `reserved_slots` attribute slots go only to priority > 0.
+    reserved_slots: NonNegativeInt = 0
+    # A waiting build gains +1 effective priority per `age_step_seconds`
+    # waited. 0 disables ageing.
+    age_step_seconds: NonNegativeInt = 900
+
+
+def priority_for(config: BuildPriorityConfig | None, event: ChangeEvent) -> int:
+    """A build's configured priority. Pure over the event's repo,
+    branch and PR number, so a build rebuilt by event_for_build gets
+    the same answer."""
+    if config is None:
+        return 0
+    kind: AttributeEvent = "pull_request" if event.pr_number is not None else "push"
+    for rule in config.rules:
+        if kind not in rule.events or not fnmatch(event.branch, rule.match):
+            continue
+        if rule.repo is not None and not fnmatch(event.repo.key, rule.repo):
+            continue
+        return rule.priority
+    return 0
+
+
 class PostBuildStep(BaseModel):
     name: str
     environment: Mapping[str, str | Interpolate]
@@ -405,6 +454,9 @@ class Config(BaseModel):
     # Global cap on concurrent attribute builds; None = derive from CPU count.
     build_concurrency: int | None = None
     build_store: BuildStoreConfig | None = None
+    # Priority for eval and attribute slots. None keeps every build
+    # equal (FIFO evals, round-robin attribute slots).
+    build_priority: BuildPriorityConfig | None = None
     # Build machines view; None hides it.
     machines: MachinesConfig | None = None
 
