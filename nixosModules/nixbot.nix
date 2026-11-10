@@ -45,6 +45,22 @@ let
       eval_worker_count = cfg.evalWorkerCount;
       eval_concurrency = cfg.evalConcurrency;
       build_concurrency = cfg.buildConcurrency;
+      build_priority =
+        if cfg.buildPriority == null then
+          null
+        else
+          {
+            rules = map (rule: {
+              inherit (rule)
+                repo
+                match
+                events
+                priority
+                ;
+            }) cfg.buildPriority.rules;
+            reserved_slots = cfg.buildPriority.reservedSlots;
+            age_step_seconds = cfg.buildPriority.ageStepSeconds;
+          };
       build_store =
         if cfg.buildStore.url == null then
           null
@@ -299,6 +315,66 @@ in
       type = lib.types.nullOr lib.types.int;
       default = null;
       description = "Global cap on concurrent attribute builds. Defaults to the CPU count.";
+    };
+
+    buildPriority = lib.mkOption {
+      type = lib.types.nullOr (
+        lib.types.submodule {
+          options = {
+            rules = lib.mkOption {
+              type = lib.types.listOf (
+                lib.types.submodule {
+                  options = {
+                    repo = lib.mkOption {
+                      type = lib.types.nullOr lib.types.str;
+                      default = null;
+                      description = "Glob over \"forge/owner/name\"; null matches every repository.";
+                    };
+                    match = lib.mkOption {
+                      type = lib.types.str;
+                      example = "main";
+                      description = "Branch glob. For a pull request it tests the base branch.";
+                    };
+                    events = lib.mkOption {
+                      type = lib.types.listOf (
+                        lib.types.enum [
+                          "push"
+                          "pull_request"
+                        ]
+                      );
+                      default = [
+                        "push"
+                        "pull_request"
+                      ];
+                      description = "Event kinds the rule applies to.";
+                    };
+                    priority = lib.mkOption {
+                      type = lib.types.int;
+                      description = "Priority of matching builds; higher takes the next free slot.";
+                    };
+                  };
+                }
+              );
+              default = [ ];
+              description = "First matching rule wins; no match means priority 0.";
+            };
+
+            reservedSlots = lib.mkOption {
+              type = lib.types.ints.unsigned;
+              default = 0;
+              description = "The last this many attribute slots go only to builds with priority above 0.";
+            };
+
+            ageStepSeconds = lib.mkOption {
+              type = lib.types.ints.unsigned;
+              default = 900;
+              description = "A waiting build gains one effective priority per this many seconds waited; 0 disables ageing.";
+            };
+          };
+        }
+      );
+      default = null;
+      description = "Service-wide priority for eval and attribute slots. null keeps first-come first-served ordering.";
     };
 
     buildStore = {
