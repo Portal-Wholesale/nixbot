@@ -64,6 +64,8 @@ Portal-Wholesale/cms.
   `outcome_status` already inverts.
 - `ignored_failure` and `post_build_failure` do not trigger a stop. The
   derivation built; only an upload or post-build step failed.
+- Internal errors (`failure_no_cache`, "internal error, see service logs") do
+  not trigger a stop. The attribute still settles `failed`.
 - `dependency_failed` and `cancelled` do not trigger. They are consequences of a
   stop or failure, not a new failure.
 
