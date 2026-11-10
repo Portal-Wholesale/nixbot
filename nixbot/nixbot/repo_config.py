@@ -50,6 +50,17 @@ class ProtectRunningRule(BaseModel):
     grace_seconds: NonNegativeInt
 
 
+# "cancel" stops every attribute build; "drain" lets running ones
+# finish.
+FailFastMode = Literal["cancel", "drain"]
+
+
+class FailFastRule(BaseModel):
+    # Branch glob, tested against the pushed branch.
+    match: str
+    mode: FailFastMode
+
+
 class BranchConfig(BaseModel):
     flake_dir: str = "."
     lock_file: str = "flake.lock"
@@ -61,6 +72,9 @@ class BranchConfig(BaseModel):
     # they have run `grace_seconds`. The first rule whose glob matches
     # wins.
     protect_running_branches: list[ProtectRunningRule] = []
+    # Push builds of matching branches stop after their first failed
+    # attribute. The first rule whose glob matches wins.
+    fail_fast_branches: list[FailFastRule] = []
     effects_on_pull_requests: bool = False
     effects_branches: list[str] = []
     # Branch globs whose pushes build, replacing the globally
@@ -94,6 +108,14 @@ class BranchConfig(BaseModel):
         for rule in self.protect_running_branches:
             if fnmatch(branch, rule.match):
                 return rule.grace_seconds
+        return None
+
+    def fail_fast(self, branch: str) -> FailFastMode | None:
+        """How a push build of `branch` stops after its first failed
+        attribute. None means it never does."""
+        for rule in self.fail_fast_branches:
+            if fnmatch(branch, rule.match):
+                return rule.mode
         return None
 
     @classmethod

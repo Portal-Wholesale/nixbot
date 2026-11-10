@@ -107,6 +107,8 @@ def get_minimal_value_for_field(
         return datetime.now(tz=UTC)
     if field_info.get("format") == "uri":
         return "http://test.example/"
+    if "enum" in field_info:
+        return field_info["enum"][0]
 
     if (value := _handle_ref_field(model_class, field_info)) is not None:
         return value

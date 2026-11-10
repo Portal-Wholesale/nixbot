@@ -225,6 +225,45 @@ def test_protect_running_branches_invalid_falls_back_to_defaults() -> None:
         assert config.protect_grace("main") is None
 
 
+def test_fail_fast_default_is_none(tmp_path: Path) -> None:
+    config = BranchConfig.load(tmp_path)
+    assert config.fail_fast_branches == []
+    assert config.fail_fast("main") is None
+
+
+def test_fail_fast_glob_match() -> None:
+    config = BranchConfig.loads(
+        '[[fail_fast_branches]]\nmatch = "release-*"\nmode = "drain"\n'
+    )
+    assert config.fail_fast("release-1") == "drain"
+    assert config.fail_fast("main") is None
+
+
+def test_fail_fast_first_rule_wins() -> None:
+    config = BranchConfig.loads(
+        "[[fail_fast_branches]]\n"
+        'match = "main"\nmode = "cancel"\n'
+        "[[fail_fast_branches]]\n"
+        'match = "*"\nmode = "drain"\n'
+    )
+    assert config.fail_fast("main") == "cancel"
+    assert config.fail_fast("production") == "drain"
+
+
+def test_fail_fast_branches_invalid_falls_back_to_defaults() -> None:
+    for rule in (
+        'match = "main"\nmode = "abort"\n',
+        'match = "main"\n',
+        'mode = "cancel"\n',
+    ):
+        config = BranchConfig.loads(
+            f'attribute = "hydraJobs"\n[[fail_fast_branches]]\n{rule}'
+        )
+        # Falls back to defaults on invalid config.
+        assert config == BranchConfig()
+        assert config.fail_fast("main") is None
+
+
 # The rules cms ships: pull requests build the fast set, `production`
 # builds the full set under its own attribute, everything else builds
 # `checks`.
