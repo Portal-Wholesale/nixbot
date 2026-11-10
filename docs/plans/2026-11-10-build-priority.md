@@ -5,8 +5,8 @@ Status: plan, not started. Branch `nick/build-priority-plan`, based on
 
 ## Problem
 
-Every build competes for the same capacity on equal terms. A post-merge
-`main` build, which gates deploys, waits behind pull-request CI:
+Every build competes for the same capacity on equal terms. A post-merge `main`
+build, which gates deploys, waits behind pull-request CI:
 
 - **Eval slots.** `Orchestrator.eval_slots` is an `asyncio.Semaphore`
   (`orchestrator.py:180`), roughly first come first served. Clan sets
@@ -21,8 +21,8 @@ Every build competes for the same capacity on equal terms. A post-merge
   9 hub builds), so part of the backlog waits at the hub, where nothing knows
   which build or branch a derivation belongs to.
 
-The work-queue claim (`ClaimNextWorkItem`, `ORDER BY created_at`) is not a
-wait point: `Service.work_loop` spawns every claimed item concurrently.
+The work-queue claim (`ClaimNextWorkItem`, `ORDER BY created_at`) is not a wait
+point: `Service.work_loop` spawns every claimed item concurrently.
 
 ## Goal
 
@@ -33,8 +33,8 @@ delayed, never starved, and nothing is preempted.
 
 ## Non-goals
 
-- No preemption. A running eval or attribute build is never cancelled or
-  paused to make room. That would repeat the supersede waste that
+- No preemption. A running eval or attribute build is never cancelled or paused
+  to make room. That would repeat the supersede waste that
   `protect_running_branches` fixed.
 - No per-repo `nixbot.toml` setting. Priority ranks builds across every
   repository the instance serves. Also, a pull request's `nixbot.toml` comes
@@ -75,9 +75,9 @@ class Config(BaseModel):
 ```
 
 `priority_for(config, event) -> int` is a pure function over `ChangeEvent`
-(`repo`, `branch`, `pr_number`). Builds reconstructed through
-`event_for_build` get the same answer, so recovery and reruns need no stored
-column and no migration.
+(`repo`, `branch`, `pr_number`). Builds reconstructed through `event_for_build`
+get the same answer, so recovery and reruns need no stored column and no
+migration.
 
 The clan setting we expect to start with:
 
@@ -119,8 +119,8 @@ class SlotKey:
   site) passes `SlotKey(build.id_, priority)` instead of `build.id_`. `SlotKey`
   is hashable, so it works as a waiter-queue key in both schedulers, and
   `FairScheduler` ignores the priority field.
-- `bootstrap.py:294` builds `FairPriorityScheduler` when
-  `config.build_priority` is set and `FairScheduler` otherwise.
+- `bootstrap.py:294` builds `FairPriorityScheduler` when `config.build_priority`
+  is set and `FairScheduler` otherwise.
 
 ### `FairPriorityScheduler`
 
@@ -134,13 +134,13 @@ The same slot pool, with one round-robin rotation per priority class:
   waiters, round-robin within that class. With every key at the same priority
   and no ageing, this is exactly `FairScheduler`.
 - Reserved slots: while `active >= capacity - reserved_slots`, only keys whose
-  *configured* priority is above 0 are granted. Ageing does not unlock
-  reserved slots, so a PR backlog can never fill them.
-- The fast path (`active < capacity and not waiters`) must check the
-  reservation too. A priority-0 acquire must not take a reserved slot just
-  because nobody is waiting.
-- Cancellation semantics, including giving back a slot granted at the same
-  time as the cancel, are copied from `FairScheduler`.
+  _configured_ priority is above 0 are granted. Ageing does not unlock reserved
+  slots, so a PR backlog can never fill them.
+- The fast path (`active < capacity and not waiters`) must check the reservation
+  too. A priority-0 acquire must not take a reserved slot just because nobody is
+  waiting.
+- Cancellation semantics, including giving back a slot granted at the same time
+  as the cancel, are copied from `FairScheduler`.
 
 ### `PrioritySemaphore` for eval slots
 
@@ -168,24 +168,25 @@ outputs).
   since `started_at` is set after acquisition). Split by whether PR builds
   overlapped. Record the numbers in this plan. This decides whether the eval
   stage or the attribute stage matters more.
-- **U1. Config.** `PriorityRule`, `BuildPriorityConfig`, `Config.build_priority`,
-  and `priority_for`, with tests: first match wins, `repo` glob, PR uses the base
-  branch, tag pushes, and the default 0.
+- **U1. Config.** `PriorityRule`, `BuildPriorityConfig`,
+  `Config.build_priority`, and `priority_for`, with tests: first match wins,
+  `repo` glob, PR uses the base branch, tag pushes, and the default 0.
 - **U2. Slot interface.** `SlotScheduler`, `SlotKey`, `NixBuildExecutor` typed
   against the protocol, and `_OrchestratorExecutor` passing `SlotKey`. No
   behaviour change; the existing `test_executor.py` passes unchanged.
-- **U3. `FairPriorityScheduler`.** Run the existing `FairScheduler` tests against
-  it with every key at priority 0 (a regression suite). Add tests for: higher
-  class first; round-robin within a class; ageing promotes a starved key;
+- **U3. `FairPriorityScheduler`.** Run the existing `FairScheduler` tests
+  against it with every key at priority 0 (a regression suite). Add tests for:
+  higher class first; round-robin within a class; ageing promotes a starved key;
   reserved slots are refused to priority 0, including on the fast path; and
   cancellation while waiting and at grant time.
 - **U4. `PrioritySemaphore`.** Wired into `Orchestrator.eval_slots` and
   `_evaluate`, with tests for ordering, ageing, and cancellation of a waiter.
 - **U5. Bootstrap selection.** Pick the classes from `config.build_priority`.
-  Add a test that a missing config keeps `FairScheduler` and `asyncio.Semaphore`.
+  Add a test that a missing config keeps `FairScheduler` and
+  `asyncio.Semaphore`.
 - **U6. Clan module.** A `buildPriority` option on the nixbot service module,
-  serialised into the service config. The pin bump and the rules above go in
-  the same clan PR.
+  serialised into the service config. The pin bump and the rules above go in the
+  same clan PR.
 - **U7. Measure after deploy.** Repeat U0, and read the hub's `/status` snapshot
   and `tribuchet_system_builds{state="queued"}` while `main` and PR builds
   overlap. Decide whether U8 is needed.
@@ -200,17 +201,17 @@ Nixbot API, `github/Portal-Wholesale/cms`, builds from 2026-11-08 to 2026-11-10:
 end of eval, for uncached attributes. It includes waiting on dependencies, and
 it cannot tell `FairScheduler` waits apart from hub waits.
 
-| `main` builds | n | p50 | p90 | max (s) |
-|---|---|---|---|---|
-| eval wait, all (PR builds overlapping) | 72 | 36 | 1419 | 7465 |
-| deferred behind a running `main` build: total wait | 71 | 33 | 1419 | 7465 |
-| deferred: wait after the blocking build finished | 71 | 6 | 19 | 7465 |
-| not deferred: eval-slot wait | 17 | 0 | 151 | 1362 |
-| attribute wait (PR builds overlapping) | 2028 | 0 | 407 | 4449 |
-| attribute wait (no PR builds overlapping) | 431 | 0 | 2 | 299 |
+| `main` builds                                      | n    | p50 | p90  | max (s) |
+| -------------------------------------------------- | ---- | --- | ---- | ------- |
+| eval wait, all (PR builds overlapping)             | 72   | 36  | 1419 | 7465    |
+| deferred behind a running `main` build: total wait | 71   | 33  | 1419 | 7465    |
+| deferred: wait after the blocking build finished   | 71   | 6   | 19   | 7465    |
+| not deferred: eval-slot wait                       | 17   | 0   | 151  | 1362    |
+| attribute wait (PR builds overlapping)             | 2028 | 0   | 407  | 4449    |
+| attribute wait (no PR builds overlapping)          | 431  | 0   | 2    | 299     |
 
-- Most of `main`'s wait is `protect_running_branches` deferral: a push waits
-  for the previous `main` build to finish. Priority cannot remove that wait
+- Most of `main`'s wait is `protect_running_branches` deferral: a push waits for
+  the previous `main` build to finish. Priority cannot remove that wait
   directly. Attribute priority shortens it, because the blocking `main` build
   finishes sooner.
 - A real eval-slot wait is a rare tail. About 5 of 88 builds waited 1–2h after
@@ -227,13 +228,13 @@ it cannot tell `FairScheduler` waits apart from hub waits.
   queued takes the next free eval slot, and its attributes take the next free
   attribute slots ahead of PR attributes.
 - No PR build waits forever: ageing promotes it within the configured step.
-- Without `build_priority`, scheduling is exactly what it is today (the
-  existing tests pass unchanged).
+- Without `build_priority`, scheduling is exactly what it is today (the existing
+  tests pass unchanged).
 - U7's numbers are recorded here.
 
 ## Open questions
 
 - Initial values for `reserved_slots` and `age_step_seconds`. The numbers above
   are guesses until U0.
-- Should the build page show a build's priority? It is cheap
-  (`priority_for` on the stored event), but it is not needed to ship.
+- Should the build page show a build's priority? It is cheap (`priority_for` on
+  the stored event), but it is not needed to ship.
