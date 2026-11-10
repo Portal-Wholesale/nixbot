@@ -28,6 +28,7 @@ from nixbot.executor import (
     FairScheduler,
     LogWriter,
     NixBuildExecutor,
+    PrioritySemaphore,
     SlotKey,
     SlotScheduler,
     StructuredCapture,
@@ -269,6 +270,94 @@ async def test_priority_cancelled_at_grant_returns_reserved_slot() -> None:
 def test_priority_scheduler_rejects_reserving_every_slot() -> None:
     with pytest.raises(ValueError, match="reserved_slots"):
         FairPriorityScheduler(2, reserved_slots=2)
+
+
+# --- PrioritySemaphore -----------------------------------------------------
+
+
+async def semaphore_order(
+    sem: PrioritySemaphore, waiters: list[tuple[str, int]]
+) -> list[str]:
+    """Enqueue `waiters` (name, priority) in order behind a held slot,
+    free it, and return the order they got it in."""
+    order: list[str] = []
+    await sem.acquire()
+
+    async def worker(name: str, priority: int) -> None:
+        async with sem.slot(priority):
+            order.append(name)
+
+    tasks = []
+    for name, priority in waiters:
+        tasks.append(asyncio.create_task(worker(name, priority)))
+        await asyncio.sleep(0)  # enqueue in this order
+    sem.release()
+    await asyncio.gather(*tasks)
+    return order
+
+
+async def test_priority_semaphore_highest_first_fifo_within() -> None:
+    order = await semaphore_order(
+        PrioritySemaphore(1),
+        [("pr1", 0), ("main1", 10), ("pr2", 0), ("mq", 5), ("main2", 10)],
+    )
+    assert order == ["main1", "main2", "mq", "pr1", "pr2"]
+
+
+@pytest.mark.parametrize(
+    ("age_step_seconds", "expected"),
+    [
+        # Two steps waited: the PR's effective priority 2 beats 1.
+        (10, ["pr", "main"]),
+        # Ageing disabled.
+        (0, ["main", "pr"]),
+    ],
+)
+async def test_priority_semaphore_ageing_promotes_waiter(
+    age_step_seconds: int, expected: list[str]
+) -> None:
+    clock = FakeClock()
+    sem = PrioritySemaphore(1, age_step_seconds=age_step_seconds, clock=clock)
+    order: list[str] = []
+    await sem.acquire()
+
+    async def worker(name: str, priority: int) -> None:
+        async with sem.slot(priority):
+            order.append(name)
+
+    pr = asyncio.create_task(worker("pr", 0))
+    await asyncio.sleep(0)
+    clock.now = 25
+    main = asyncio.create_task(worker("main", 1))
+    await asyncio.sleep(0)
+    sem.release()
+    await asyncio.gather(pr, main)
+    assert order == expected
+
+
+async def test_priority_semaphore_cancelled_waiter() -> None:
+    sem = PrioritySemaphore(1)
+    await sem.acquire()
+    high = asyncio.create_task(sem.acquire(10))
+    low = asyncio.create_task(sem.acquire(0))
+    await asyncio.sleep(0)
+    high.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await high
+    sem.release()
+    await asyncio.wait_for(low, timeout=1)
+
+
+async def test_priority_semaphore_cancelled_at_grant() -> None:
+    sem = PrioritySemaphore(1)
+    await sem.acquire()
+    waiter = asyncio.create_task(sem.acquire(10))
+    await asyncio.sleep(0)
+    sem.release()  # grants `waiter`
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    await asyncio.wait_for(sem.acquire(), timeout=1)
 
 
 # --- LogWriter --------------------------------------------------------------

@@ -246,12 +246,14 @@ def make_orchestrator(
     tmp_path: Path,
     eval_runner: EvalRunnerLike,
     executor: AttributeExecutor,
+    build_priority: BuildPriorityConfig | None = None,
 ) -> tuple[Orchestrator, RecordingReporter]:
     config = Config(
         db_url="unused",
         build_systems=["x86_64-linux"],
         url="https://ci.test",
         state_dir=tmp_path / "state",
+        build_priority=build_priority,
     )
     reporter = RecordingReporter()
     registered: list[tuple[Path, str, str, str]] = []
@@ -1205,6 +1207,38 @@ async def test_build_waiting_for_eval_slot_stays_pending(
     block.set()
     await asyncio.wait_for(tasks[0], timeout=10)
     assert eval_runner.calls == 1
+
+
+async def test_eval_slot_goes_to_higher_priority_build(
+    pool: asyncpg.Pool, tmp_path: Path
+) -> None:
+    """A main push queued behind a PR eval takes the next eval slot."""
+    orchestrator, _ = make_orchestrator(
+        pool,
+        tmp_path,
+        FakeEvalRunner([]),
+        FakeExecutor(),
+        build_priority=BuildPriorityConfig(
+            rules=[PriorityRule(match="main", events=["push"], priority=10)]
+        ),
+    )
+    project = await make_project(pool, name="eval-priority")
+    pr = ChangeEvent(repo=project, branch="main", commit_sha="a" * 40, pr_number=1)
+    push = ChangeEvent(repo=project, branch="main", commit_sha="b" * 40)
+    order: list[str] = []
+
+    async def evaluate(name: str, event: ChangeEvent) -> None:
+        async with orchestrator.eval_slot(event):
+            order.append(name)
+
+    async with orchestrator.eval_slot(pr):  # the only slot
+        tasks = [
+            asyncio.create_task(evaluate("pr", pr)),
+            asyncio.create_task(evaluate("main", push)),
+        ]
+        await asyncio.sleep(0)
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=10)
+    assert order == ["main", "pr"]
 
 
 async def test_pending_attribute_rows_recorded_for_crash_recovery(

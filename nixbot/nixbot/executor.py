@@ -220,6 +220,8 @@ def aged_priority(priority: int, waited: float, age_step_seconds: int) -> int:
 class _SlotWaiter:
     future: asyncio.Future[None]
     since: float
+    # PrioritySemaphore only; FairPriorityScheduler reads the key's.
+    priority: int = 0
 
 
 class FairPriorityScheduler:
@@ -326,6 +328,73 @@ class FairPriorityScheduler:
                 del self._waiters[key]
             if not waiter.future.done():
                 self._active += 1
+                waiter.future.set_result(None)
+
+
+class PrioritySemaphore:
+    """Semaphore whose waiters are served highest effective priority
+    first (the acquire priority plus ageing), FIFO within a class. No
+    reservation; nothing is preempted. Caps concurrent evaluations when
+    build priority is configured."""
+
+    def __init__(
+        self,
+        value: int,
+        *,
+        age_step_seconds: int = 0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if value < 1:
+            msg = f"value must be >= 1, got {value}"
+            raise ValueError(msg)
+        self.age_step_seconds = age_step_seconds
+        self._clock = clock
+        self._free = value
+        # Arrival order, so the first of a class is the oldest.
+        self._waiters: list[_SlotWaiter] = []
+
+    async def acquire(self, priority: int = 0) -> None:
+        if self._free > 0 and not self._waiters:
+            self._free -= 1
+            return
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        waiter = _SlotWaiter(future, self._clock(), priority)
+        self._waiters.append(waiter)
+        try:
+            await future
+        except asyncio.CancelledError:
+            if waiter in self._waiters:
+                self._waiters.remove(waiter)
+            if future.cancelled() or not future.done():
+                raise
+            # Granted concurrently with cancellation: give the slot back.
+            self.release()
+            raise
+
+    def release(self) -> None:
+        self._free += 1
+        self._dispatch()
+
+    @contextlib.asynccontextmanager
+    async def slot(self, priority: int) -> AsyncIterator[None]:
+        await self.acquire(priority)
+        try:
+            yield
+        finally:
+            self.release()
+
+    def _dispatch(self) -> None:
+        while self._free > 0 and self._waiters:
+            now = self._clock()
+            waiter = max(
+                self._waiters,
+                key=lambda w: aged_priority(
+                    w.priority, now - w.since, self.age_step_seconds
+                ),
+            )
+            self._waiters.remove(waiter)
+            if not waiter.future.done():
+                self._free -= 1
                 waiter.future.set_result(None)
 
 

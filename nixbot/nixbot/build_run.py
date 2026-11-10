@@ -374,7 +374,7 @@ async def _evaluate(  # noqa: PLR0913
                 o.pool, id_=build.id_, warnings=json.dumps(live_warnings.snapshot())
             )
 
-    async with o.eval_slots:
+    async with o.eval_slot(event):
         await db.set_build_status(o.pool, build.id_, BuildStatus.EVALUATING)
         await _prefetch_inputs(o, build, worktree_path, branch_config, credentials)
         settings = _eval_settings(o, event, build, credentials)

@@ -35,6 +35,7 @@ from .canceller import (
     branch_key,
     has_skip_ci_marker,
 )
+from .config import priority_for
 from .db import BuildStatus
 from .db_gen import builds as builds_q
 from .db_gen import deferred as deferred_q
@@ -54,6 +55,7 @@ from .events import (
 )
 from .executor import (
     LogWriter,
+    PrioritySemaphore,
     attribute_log_path,
     build_log_dir,
     effect_run_log_path,
@@ -169,8 +171,9 @@ class Orchestrator:
     task_tokens: TaskTokens = field(default_factory=TaskTokens)
     # Second contexts attached to an in-flight build, for status fan-out.
     linked_events: dict[int, list[ChangeEvent]] = field(default_factory=dict)
-    # Caps concurrent evaluations to bound memory use.
-    eval_slots: asyncio.Semaphore = field(init=False)
+    # Caps concurrent evaluations to bound memory use. Served by build
+    # priority when one is configured.
+    eval_slots: asyncio.Semaphore | PrioritySemaphore = field(init=False)
     # Pulsed on every release_run().
     _run_released: asyncio.Event = field(default_factory=asyncio.Event)
     # Re-enqueues a deferred change (its stored ChangeRequest payload)
@@ -178,7 +181,20 @@ class Orchestrator:
     release_deferred: Callable[[dict[str, Any]], Awaitable[None]] | None = None
 
     def __post_init__(self) -> None:
-        self.eval_slots = asyncio.Semaphore(self.config.eval_concurrency)
+        priority = self.config.build_priority
+        if priority is None:
+            self.eval_slots = asyncio.Semaphore(self.config.eval_concurrency)
+        else:
+            self.eval_slots = PrioritySemaphore(
+                self.config.eval_concurrency,
+                age_step_seconds=priority.age_step_seconds,
+            )
+
+    def eval_slot(self, event: ChangeEvent) -> AbstractAsyncContextManager[None]:
+        """Hold one evaluation slot, taken by the build's priority."""
+        if isinstance(self.eval_slots, PrioritySemaphore):
+            return self.eval_slots.slot(priority_for(self.config.build_priority, event))
+        return self.eval_slots
 
     def release_run(self, build_id: int) -> None:
         self.cancel_events.pop(build_id, None)
