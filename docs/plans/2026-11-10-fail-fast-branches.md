@@ -59,6 +59,7 @@ Portal-Wholesale/cms.
 
 **What triggers a stop:** the first attribute that settles as `failed`,
 `failed_eval`, or `cached_failure`.
+
 - `requireFailure` attributes count only through their final status, which
   `outcome_status` already inverts.
 - `ignored_failure` and `post_build_failure` do not trigger a stop. The
@@ -66,14 +67,14 @@ Portal-Wholesale/cms.
 - `dependency_failed` and `cancelled` do not trigger. They are consequences of a
   stop or failure, not a new failure.
 
-| State when the stop fires        | `cancel`                                   | `drain`                    |
-| -------------------------------- | ------------------------------------------ | -------------------------- |
-| Evaluation still running         | stopped; unevaluated attributes get no row | same                       |
-| Pending jobs (dependencies)      | settled `cancelled`                        | same                       |
-| Started, waiting for a slot      | `cancelled`, never takes a slot            | same                       |
-| Running `nix build`              | process group killed, `cancelled`          | runs to its own result     |
-| Late eval batch (already queued) | settled `cancelled`                        | same                       |
-| Build aggregate                  | `FAILED` (one attribute failed)            | `FAILED`                   |
+| State when the stop fires        | `cancel`                                   | `drain`                |
+| -------------------------------- | ------------------------------------------ | ---------------------- |
+| Evaluation still running         | stopped; unevaluated attributes get no row | same                   |
+| Pending jobs (dependencies)      | settled `cancelled`                        | same                   |
+| Started, waiting for a slot      | `cancelled`, never takes a slot            | same                   |
+| Running `nix build`              | process group killed, `cancelled`          | runs to its own result |
+| Late eval batch (already queued) | settled `cancelled`                        | same                   |
+| Build aggregate                  | `FAILED` (one attribute failed)            | `FAILED`               |
 
 Every stopped attribute's error reads `stopped: fail-fast after <attr>`, so it
 is not confused with a supersede. The build summary names the attribute that
@@ -135,6 +136,7 @@ settles it as `CANCELLED` through `_settle_aborted`, and it has to end as
 `build_run.py` runs the eval and `build_attributes` concurrently and races the
 eval against `cancel_wait`. Add the stop as a third wait. If it fires while the
 eval is running:
+
 - reap only `eval_task` (`nix-eval-jobs` is killed and the eval slot freed);
 - put the `None` sentinel on `jobs_queue` so `run_incremental` finishes;
 - let `build_task` end normally: `aggregate_build` sees a failed attribute and
@@ -144,8 +146,8 @@ eval is running:
 
 ### Where the rule is resolved
 
-In the change path where `branch_config` is already loaded, for push events
-only and not for restarts. That path builds a `FailFastStop` and passes it to
+In the change path where `branch_config` is already loaded, for push events only
+and not for restarts. That path builds a `FailFastStop` and passes it to
 `build_attributes` and on to `JobScheduler`. `build_attributes` gains a
 `fail_fast` keyword argument that defaults to `None`, so reruns and recovery
 pass nothing.
@@ -158,15 +160,15 @@ pass nothing.
 - `finish_tracking` releases a deferred push as soon as the protected build
   ends, so a fail-fast stop on a protected `main` build starts the waiting
   commit early.
-- Tribuchet drops a queued hub job only when every attached client is gone, so
-  a derivation that a PR build also needs keeps building.
+- Tribuchet drops a queued hub job only when every attached client is gone, so a
+  derivation that a PR build also needs keeps building.
 
 ## Implementation units
 
-- **U1. Repo config.** `FailFastRule` (`match`, `mode: Literal["cancel", "drain"]`),
-  `BranchConfig.fail_fast_branches` and `fail_fast(branch)`, with tests in
-  `test_repo_config.py`: first match wins, no match, and invalid mode falls back
-  to defaults like any invalid config.
+- **U1. Repo config.** `FailFastRule` (`match`,
+  `mode: Literal["cancel", "drain"]`), `BranchConfig.fail_fast_branches` and
+  `fail_fast(branch)`, with tests in `test_repo_config.py`: first match wins, no
+  match, and invalid mode falls back to defaults like any invalid config.
 - **U2. Scheduler.** `FailFastStop` and the `JobScheduler` changes. Tests in
   `test_build_scheduler.py` with a fake executor:
   - each triggering status fires the stop; each non-triggering one doesn't;
@@ -207,5 +209,5 @@ pass nothing.
   `cancel`, switching to `drain` if fixing one failure at a time hurts.
 - Should a flake-retry policy (rerun the triggering attribute once before
   stopping) be part of this? The suggestion is no. The executor's transient
-  retry already covers infrastructure errors, and a genuinely flaky test
-  blocked promotion before this change too.
+  retry already covers infrastructure errors, and a genuinely flaky test blocked
+  promotion before this change too.
