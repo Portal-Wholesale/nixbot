@@ -107,6 +107,9 @@ class BuildResult:
     generation: int
     results: list[AttributeResult]
     attr_statuses: dict[str, str] | None = None
+    # Set when a fail-fast stop ended the build ("stopped: fail-fast
+    # after <attr>"), naming the attribute that triggered it.
+    stop_reason: str | None = None
 
 
 class StatusReporter(Protocol):
@@ -118,7 +121,9 @@ class StatusReporter(Protocol):
         self, event: ChangeEvent, build: BuildRecord, report: EvalReport
     ) -> None: ...
 
-    async def eval_cancelled(self, event: ChangeEvent, build: BuildRecord) -> None: ...
+    async def eval_cancelled(
+        self, event: ChangeEvent, build: BuildRecord, reason: str | None = None
+    ) -> None: ...
 
     async def build_finished(
         self, event: ChangeEvent, build: BuildRecord, result: BuildResult
@@ -169,7 +174,9 @@ class NullStatusReporter:
     ) -> None:
         pass
 
-    async def eval_cancelled(self, event: ChangeEvent, build: BuildRecord) -> None:
+    async def eval_cancelled(
+        self, event: ChangeEvent, build: BuildRecord, reason: str | None = None
+    ) -> None:
         pass
 
     async def build_finished(

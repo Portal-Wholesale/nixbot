@@ -482,7 +482,7 @@ async def _run_build_inner(  # noqa: PLR0913
             return
         if stop is not None and stop.fired and not eval_task.done():
             await _stop_eval(
-                o, event, build, eval_task, build_task, jobs_queue, live_warnings
+                o, event, build, stop, eval_task, build_task, jobs_queue, live_warnings
             )
             return
         # EvalError and anything else propagate to run_build,
@@ -523,6 +523,7 @@ async def _stop_eval(  # noqa: PLR0913
     o: Orchestrator,
     event: ChangeEvent,
     build: BuildRecord,
+    stop: FailFastStop,
     eval_task: asyncio.Future[EvalResult],
     build_task: asyncio.Task[str],
     jobs_queue: asyncio.Queue[list[NixEvalJob] | None],
@@ -534,7 +535,7 @@ async def _stop_eval(  # noqa: PLR0913
     an eval error, so no eval failure handling."""
     await _reap(eval_task)
     await _flush_eval_warnings(o, build, live_warnings)
-    await o.reporter.eval_cancelled(event, build)
+    await o.reporter.eval_cancelled(event, build, stop.reason)
     await db.set_build_status(o.pool, build.id_, BuildStatus.BUILDING)
     await jobs_queue.put(None)
     await build_task
@@ -671,6 +672,9 @@ async def build_attributes(  # noqa: PLR0913
         await db.set_build_status(
             o.pool, build.id_, BuildStatus.FAILED, error=post_process_error
         )
+    stop_reason = (
+        fail_fast.reason if fail_fast is not None and fail_fast.fired else None
+    )
     await o.reporter.build_finished(
         event,
         build,
@@ -682,11 +686,14 @@ async def build_attributes(  # noqa: PLR0913
                 r.attr: r.status
                 for r in await q.attribute_statuses(o.pool, build_id=build.id_)
             },
+            stop_reason=stop_reason,
         ),
     )
     await o.finish_linked(
         build,
-        BuildResult(status, generation, schedule_result.results),
+        BuildResult(
+            status, generation, schedule_result.results, stop_reason=stop_reason
+        ),
         eval_success=True,
     )
     o.release_run(build.id_)

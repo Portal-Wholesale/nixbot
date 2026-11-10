@@ -149,6 +149,7 @@ class FakeExecutor:
 @dataclass
 class RecordingReporter:
     events: list[tuple] = field(default_factory=list)
+    results: list[BuildResult] = field(default_factory=list)
     started: asyncio.Event = field(default_factory=asyncio.Event)
 
     async def build_started(self, event: ChangeEvent, build: BuildRecord) -> None:
@@ -160,13 +161,20 @@ class RecordingReporter:
     ) -> None:
         self.events.append(("eval", build.id_, report.success, tuple(report.warnings)))
 
-    async def eval_cancelled(self, event: ChangeEvent, build: BuildRecord) -> None:
-        self.events.append(("eval-cancelled", build.id_))
+    async def eval_cancelled(
+        self, event: ChangeEvent, build: BuildRecord, reason: str | None = None
+    ) -> None:
+        self.events.append(
+            ("eval-cancelled", build.id_)
+            if reason is None
+            else ("eval-cancelled", build.id_, reason)
+        )
 
     async def build_finished(
         self, event: ChangeEvent, build: BuildRecord, result: BuildResult
     ) -> None:
         self.events.append(("finished", build.id_, result.status, result.generation))
+        self.results.append(result)
 
     async def build_restarted(
         self, event: ChangeEvent, build: BuildRecord, attr: str | None
@@ -3771,9 +3779,10 @@ async def test_fail_fast_cancel_stops_eval_and_fails_build(
     assert rows["b"] == ("cancelled", reason)
     assert rows["c"] == ("cancelled", reason)
     assert rows["d"][0] == "cancelled"
-    assert ("eval-cancelled", build.id_) in reporter.events
-    finished = [e for e in reporter.events if e[:2] == ("finished", build.id_)]
-    assert [e[2] for e in finished] == [BuildStatus.FAILED]
+    assert ("eval-cancelled", build.id_, reason) in reporter.events
+    assert [(r.status, r.stop_reason) for r in reporter.results] == [
+        (BuildStatus.FAILED, reason)
+    ]
     assert not any(e[:3] == ("eval", build.id_, False) for e in reporter.events)
 
 

@@ -520,15 +520,17 @@ class ForgeStatusReporter:
                 else None,
             )
 
-    async def eval_cancelled(self, event: ChangeEvent, build: BuildRecord) -> None:
+    async def eval_cancelled(
+        self, event: ChangeEvent, build: BuildRecord, reason: str | None = None
+    ) -> None:
         """Resolve the pending eval context. See the orchestrator's
-        cancel path."""
+        cancel path. `reason` explains a fail-fast stop."""
         await self._post(
             event,
             build,
             f"{self.context_prefix}/nix-eval",
             StatusState.error,
-            "build cancelled",
+            reason or "build cancelled",
         )
 
     async def effect_started(
@@ -623,7 +625,7 @@ class ForgeStatusReporter:
             else {r.attr: r.status.value for r in results}
         )
         counts = await self._post_attribute_statuses(event, build, statuses, detail)
-        await self._post_summary(event, build, result.status, counts, statuses)
+        await self._post_summary(event, build, result, counts, statuses)
 
     async def build_restarted(
         self, event: ChangeEvent, build: BuildRecord, attr: str | None
@@ -692,7 +694,10 @@ class ForgeStatusReporter:
 
         counts = {"failed": 0, "succeeded": 0, "cancelled": 0}
         reported = 0
-        for attr, status in statuses.items():
+        # Real failures first: after a fail-fast stop, the cancelled
+        # attributes must not use up the budget before the trigger.
+        ordered = sorted(statuses.items(), key=lambda item: item[1] == "cancelled")
+        for attr, status in ordered:
             counts[_count_key(status)] += 1
             context = attr_status_context(
                 event.repo.forge,
@@ -741,10 +746,11 @@ class ForgeStatusReporter:
         self,
         event: ChangeEvent,
         build: BuildRecord,
-        status: str,
+        result: BuildResult,
         counts: dict[str, int],
         statuses: dict[str, str],
     ) -> None:
+        status = result.status
         if status == "succeeded":
             state = StatusState.success
             description = f"{counts['succeeded']} attributes built"
@@ -766,6 +772,8 @@ class ForgeStatusReporter:
                 if counts["failed"]
                 else (build.tree_hash and "build failed") or "merge conflict"
             )
+            if result.stop_reason:
+                description = f"{description}, {result.stop_reason}"
         await self._post(
             event,
             build,
