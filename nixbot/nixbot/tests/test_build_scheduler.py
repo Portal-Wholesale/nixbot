@@ -6,11 +6,14 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 
+import pytest
+
 from nixbot.build_scheduler import (
     AttributeResult,
     AttributeStatus,
     BuildOutcome,
     CachedFailure,
+    FailFastStop,
     JobScheduler,
     ScheduleResult,
     _success_result,
@@ -608,3 +611,228 @@ def test_deps_only_result_has_no_out_path() -> None:
     job = _with_extra(mk_job("shell"), buildDependenciesOnly=True)
     result = _success_result(job, AttributeStatus.succeeded)
     assert result.out_path is None
+
+
+# --- fail-fast -------------------------------------------------------------
+
+
+def _cache_for(job: NixEvalJobSuccess) -> FakeCache:
+    return FakeCache(
+        {
+            job.drv_path: CachedFailure(
+                drv_path=job.drv_path,
+                time=datetime(2026, 1, 1, tzinfo=UTC),
+                url="http://ci/builds/1",
+            )
+        }
+    )
+
+
+async def _run_fail_fast(
+    bad: NixEvalJobSuccess,
+    outcome: BuildOutcome,
+    *,
+    cache: FakeCache | None = None,
+    fail_fast: FailFastStop | None = None,
+) -> tuple[FakeExecutor, ScheduleResult]:
+    """`bad` settles with `outcome` while `slow` is still running and
+    `x` waits for `slow`. `slow` finishes once `bad` is reported."""
+    bad_reported = asyncio.Event()
+
+    class GatedExecutor(FakeExecutor):
+        async def build(self, job: NixEvalJobSuccess) -> BuildOutcome:
+            if job.attr == "slow":
+                await bad_reported.wait()
+            return await super().build(job)
+
+    async def on_result(result: AttributeResult) -> None:
+        if result.attr == bad.attr:
+            bad_reported.set()
+
+    executor = GatedExecutor({bad.attr: outcome})
+    scheduler = JobScheduler(
+        executor,
+        [SYSTEM],
+        failed_build_cache=cache,
+        on_result=on_result,
+        fail_fast=fail_fast,
+    )
+    jobs: list[NixEvalJob] = [bad, mk_job("slow"), mk_job("x", deps=["slow"])]
+    result = await asyncio.wait_for(scheduler.run(jobs), timeout=5)
+    return executor, result
+
+
+def test_fail_fast_stop_modes() -> None:
+    drain = FailFastStop("drain")
+    assert drain.fire("a")
+    assert drain.stop_queued.is_set()
+    assert not drain.stop_running.is_set()
+    # Only the first call wins.
+    assert not drain.fire("b")
+    assert drain.trigger_attr == "a"
+    assert drain.reason == "stopped: fail-fast after a"
+
+    cancel = FailFastStop("cancel")
+    assert cancel.fire("a")
+    assert cancel.stop_queued.is_set()
+    assert cancel.stop_running.is_set()
+
+
+@pytest.mark.parametrize(
+    ("bad", "outcome", "cached"),
+    [
+        (mk_job("bad"), BuildOutcome.failure, False),
+        (mk_job("bad"), BuildOutcome.failure_no_cache, False),
+        # The build succeeded although requireFailure is set.
+        (_with_extra(mk_job("bad"), requireFailure=True), BuildOutcome.success, False),
+        (mk_job("bad"), BuildOutcome.success, True),
+    ],
+    ids=["failed", "failed-no-cache", "require-failure-succeeded", "cached-failure"],
+)
+async def test_fail_fast_triggering_status_stops(
+    bad: NixEvalJobSuccess, outcome: BuildOutcome, *, cached: bool
+) -> None:
+    stop = FailFastStop("drain")
+    executor, result = await _run_fail_fast(
+        bad, outcome, cache=_cache_for(bad) if cached else None, fail_fast=stop
+    )
+    assert stop.trigger_attr == "bad"
+    assert stop.stop_queued.is_set()
+    statuses = by_attr(result)
+    assert statuses["bad"] in {AttributeStatus.failed, AttributeStatus.cached_failure}
+    # The pending job never builds; the running one drains.
+    assert "x" not in executor.built
+    assert statuses["x"] == AttributeStatus.cancelled
+    if cached:
+        # A cached failure fires while dispatching, before slow starts.
+        assert "slow" not in executor.built
+        assert statuses["slow"] == AttributeStatus.cancelled
+    else:
+        assert statuses["slow"] == AttributeStatus.succeeded
+    errors = {r.attr: r.error for r in result.results}
+    assert errors["x"] == "stopped: fail-fast after bad"
+    assert not result.success
+
+
+@pytest.mark.parametrize(
+    ("bad", "outcome"),
+    [
+        (_with_extra(mk_job("bad"), ignoreFailure=True), BuildOutcome.failure),
+        (mk_job("bad"), BuildOutcome.post_build_failure),
+        (_with_extra(mk_job("bad"), requireFailure=True), BuildOutcome.failure),
+        (mk_job("bad"), BuildOutcome.cancelled),
+    ],
+    ids=["ignored-failure", "post-build-failure", "require-failure-met", "cancelled"],
+)
+async def test_fail_fast_non_triggering_status_does_not_stop(
+    bad: NixEvalJobSuccess, outcome: BuildOutcome
+) -> None:
+    stop = FailFastStop("cancel")
+    executor, result = await _run_fail_fast(bad, outcome, fail_fast=stop)
+    assert not stop.fired
+    assert not stop.stop_queued.is_set()
+    assert "x" in executor.built
+    assert by_attr(result)["x"] == AttributeStatus.succeeded
+
+
+async def test_fail_fast_failed_eval_stops_batch() -> None:
+    stop = FailFastStop("drain")
+    executor = FakeExecutor()
+    scheduler = JobScheduler(executor, [SYSTEM], fail_fast=stop)
+    bad = NixEvalJobError(error="boom", attr="bad", attr_path=["bad"])
+    result = await scheduler.run([mk_job("a"), bad, mk_job("b", deps=["a"])])
+    assert stop.trigger_attr == "bad"
+    assert executor.built == []
+    statuses = by_attr(result)
+    assert statuses["bad"] == AttributeStatus.failed_eval
+    assert statuses["a"] == AttributeStatus.cancelled
+    assert statuses["b"] == AttributeStatus.cancelled
+    assert {r.error for r in result.results if r.attr != "bad"} == {
+        "stopped: fail-fast after bad"
+    }
+
+
+async def test_fail_fast_late_batch_settles_cancelled() -> None:
+    stop = FailFastStop("drain")
+    bad_reported = asyncio.Event()
+
+    async def on_result(result: AttributeResult) -> None:
+        if result.attr == "bad":
+            bad_reported.set()
+
+    executor = FakeExecutor({"bad": BuildOutcome.failure})
+    scheduler = JobScheduler(executor, [SYSTEM], on_result=on_result, fail_fast=stop)
+    queue: asyncio.Queue[list[NixEvalJob] | None] = asyncio.Queue()
+    await queue.put([mk_job("bad")])
+    run_task = asyncio.create_task(scheduler.run_incremental(queue))
+    await asyncio.wait_for(bad_reported.wait(), timeout=5)
+    late_err = NixEvalJobError(error="boom", attr="late-err", attr_path=["late-err"])
+    await queue.put(
+        [
+            mk_job("late"),
+            mk_job("late-dep", deps=["bad"]),
+            late_err,
+            mk_job("foreign", system="riscv64-linux"),
+        ]
+    )
+    await queue.put(None)
+    result = await asyncio.wait_for(run_task, timeout=5)
+    assert executor.built == ["bad"]
+    statuses = by_attr(result)
+    assert statuses["late"] == AttributeStatus.cancelled
+    assert statuses["late-dep"] == AttributeStatus.cancelled
+    # A late eval error is still reported as one but does not re-fire.
+    assert statuses["late-err"] == AttributeStatus.failed_eval
+    assert "foreign" not in statuses
+    assert stop.trigger_attr == "bad"
+    errors = {r.attr: r.error for r in result.results}
+    assert errors["late"] == "stopped: fail-fast after bad"
+
+
+async def test_fail_fast_only_first_failure_fires() -> None:
+    stop = FailFastStop("cancel")
+
+    class StopAwareExecutor(FakeExecutor):
+        async def build(self, job: NixEvalJobSuccess) -> BuildOutcome:
+            if job.attr == "slow":
+                # What the executor does with stop_running in cancel mode.
+                await stop.stop_running.wait()
+                return BuildOutcome.cancelled
+            if job.attr == "bad2":
+                # Still running when bad1 fires the stop.
+                await stop.stop_queued.wait()
+            return await super().build(job)
+
+    executor = StopAwareExecutor(
+        {"bad1": BuildOutcome.failure, "bad2": BuildOutcome.failure}
+    )
+    scheduler = JobScheduler(executor, [SYSTEM], fail_fast=stop)
+    jobs: list[NixEvalJob] = [
+        mk_job("bad1"),
+        mk_job("bad2"),
+        mk_job("slow"),
+        mk_job("child", deps=["bad1"]),
+        mk_job("x", deps=["slow"]),
+    ]
+    result = await asyncio.wait_for(scheduler.run(jobs), timeout=5)
+    assert stop.trigger_attr == "bad1"
+    statuses = by_attr(result)
+    assert statuses["bad1"] == AttributeStatus.failed
+    assert statuses["bad2"] == AttributeStatus.failed
+    # A dependent of the trigger is a genuine dependency failure.
+    assert statuses["child"] == AttributeStatus.dependency_failed
+    assert statuses["x"] == AttributeStatus.cancelled
+    # A build killed by the stop carries the stop reason.
+    assert statuses["slow"] == AttributeStatus.cancelled
+    errors = {r.attr: r.error for r in result.results}
+    assert errors["slow"] == "stopped: fail-fast after bad1"
+    assert errors["x"] == "stopped: fail-fast after bad1"
+
+
+async def test_fail_fast_unset_keeps_building() -> None:
+    executor, result = await _run_fail_fast(mk_job("bad"), BuildOutcome.failure)
+    assert "x" in executor.built
+    statuses = by_attr(result)
+    assert statuses["bad"] == AttributeStatus.failed
+    assert statuses["x"] == AttributeStatus.succeeded
+    assert all(r.error is None for r in result.results)

@@ -33,6 +33,8 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
     from datetime import datetime
 
+    from .repo_config import FailFastMode
+
 from .ansi import strip_ansi
 from .models import (
     CacheStatus,
@@ -127,6 +129,39 @@ TERMINAL_FAILURES = {
     AttributeStatus.dependency_failed,
     AttributeStatus.cached_failure,
 }
+
+
+@dataclass
+class FailFastStop:
+    """Stops a build after its first failed attribute. Shared by the
+    scheduler (which fires it) and the executor (which honors it)."""
+
+    mode: FailFastMode
+    # Set by the first triggering failure.
+    trigger_attr: str | None = None
+    # Both modes: jobs waiting for a slot give up.
+    stop_queued: asyncio.Event = field(default_factory=asyncio.Event)
+    # Cancel mode only: running builds are killed.
+    stop_running: asyncio.Event = field(default_factory=asyncio.Event)
+
+    @property
+    def fired(self) -> bool:
+        return self.trigger_attr is not None
+
+    @property
+    def reason(self) -> str:
+        return f"stopped: fail-fast after {self.trigger_attr}"
+
+    def fire(self, attr: str) -> bool:
+        """Record `attr` as the trigger and stop. Only the first call
+        wins; returns whether this one did."""
+        if self.fired:
+            return False
+        self.trigger_attr = attr
+        self.stop_queued.set()
+        if self.mode == "cancel":
+            self.stop_running.set()
+        return True
 
 
 @dataclass
@@ -366,7 +401,7 @@ class _State:
 class JobScheduler:
     """Schedules evaluated attributes in dependency order."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         executor: BuildExecutor,
         supported_systems: list[str],
@@ -374,6 +409,7 @@ class JobScheduler:
         *,
         build_url: str = "",
         on_result: Callable[[AttributeResult], Awaitable[None]] | None = None,
+        fail_fast: FailFastStop | None = None,
     ) -> None:
         self.executor = executor
         self.supported_systems = supported_systems
@@ -381,16 +417,40 @@ class JobScheduler:
         self.build_url = build_url
         # Called for each result as soon as it is known.
         self.on_result = on_result
+        self.fail_fast = fail_fast
+
+    @property
+    def _stopped(self) -> bool:
+        return self.fail_fast is not None and self.fail_fast.fired
+
+    def _trigger_fail_fast(self, state: _State, attr: str) -> None:
+        """Called on each failure. The first one stops the build: every
+        pending job settles as cancelled, and so do their late-arriving
+        dependents."""
+        if self.fail_fast is None or not self.fail_fast.fire(attr):
+            return
+        for job in state.pending:
+            self._settle_stopped(state, job)
+        state.pending.clear()
+
+    def _settle_stopped(self, state: _State, job: NixEvalJobSuccess) -> None:
+        assert self.fail_fast is not None  # noqa: S101
+        state.failed_drvs.add(job.drv_path)
+        state.cancelled_drvs.add(job.drv_path)
+        reason = self.fail_fast.reason
+        state.result.results.append(
+            _success_result(job, AttributeStatus.cancelled, error=reason)
+        )
 
     def _partition_jobs(
-        self, jobs: list[NixEvalJob], result: ScheduleResult
+        self, jobs: list[NixEvalJob], state: _State
     ) -> list[NixEvalJobSuccess]:
         """Split eval output: per-attribute failed-eval records, plus the
         buildable jobs filtered by supported systems."""
         successful_jobs: list[NixEvalJobSuccess] = []
         for job in jobs:
             if isinstance(job, NixEvalJobError):
-                result.results.append(
+                state.result.results.append(
                     AttributeResult(
                         attr=job.attr,
                         status=AttributeStatus.failed_eval,
@@ -398,6 +458,7 @@ class JobScheduler:
                         error=job.error,
                     )
                 )
+                self._trigger_fail_fast(state, job.attr)
             elif job.system in self.supported_systems:
                 successful_jobs.append(job)
             # Unsupported systems are dropped: the orchestrator never
@@ -418,6 +479,9 @@ class JobScheduler:
                 return any_ready
             any_ready = True
             for job in ready:
+                if self._stopped:
+                    # The stop settled the rest of `ready` with pending.
+                    break
                 state.pending.remove(job)
                 action = await self._classify(job, state.result)
                 if action == "run":
@@ -429,12 +493,19 @@ class JobScheduler:
                         # Cached failure counts as a failure: propagate to
                         # dependents before pruning.
                         state.fail_dependents(job, AttributeStatus.dependency_failed)
+                        self._trigger_fail_fast(state, job.attr)
                     state.prune(job.drv_path)
 
     async def _finish_job(
         self, state: _State, job: NixEvalJobSuccess, outcome: BuildOutcome
     ) -> None:
         status, error = outcome_status(job, outcome)
+        if (
+            status == AttributeStatus.cancelled
+            and self.fail_fast is not None
+            and self.fail_fast.fired
+        ):
+            error = self.fail_fast.reason
         state.result.results.append(_success_result(job, status, error=error))
         # post_build_failure: the derivation itself built, so do not cache
         # it as a failed build and do not fail dependents.
@@ -455,6 +526,13 @@ class JobScheduler:
                 if cancelled
                 else AttributeStatus.dependency_failed,
             )
+        # A post-build failure built the derivation, so it does not
+        # stop the build.
+        if (
+            status == AttributeStatus.failed
+            and outcome != BuildOutcome.post_build_failure
+        ):
+            self._trigger_fail_fast(state, job.attr)
         state.prune(job.drv_path)
 
     async def _wait_for_progress(
@@ -518,7 +596,12 @@ class JobScheduler:
         dependencies on failed drvs settle the new job immediately."""
         fresh = [job for job in batch if job.attr not in state.seen_attrs]
         state.seen_attrs.update(job.attr for job in fresh)
-        new_jobs = self._partition_jobs(fresh, state.result)
+        new_jobs = self._partition_jobs(fresh, state)
+        if self._stopped:
+            # A batch the eval delivered after (or with) the stop.
+            for job in new_jobs:
+                self._settle_stopped(state, job)
+            return
         # Settle jobs depending on failed drvs. Iterate new and already
         # pending jobs to a fixpoint: neither batches nor batch arrival
         # order is topological, so a dependent may precede the job that
