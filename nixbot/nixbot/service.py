@@ -127,8 +127,10 @@ class RetryingReporter:
     ) -> None:
         await self.inner.eval_finished(event, build, report)
 
-    async def eval_cancelled(self, event: ChangeEvent, build: BuildRecord) -> None:
-        await self.inner.eval_cancelled(event, build)
+    async def eval_cancelled(
+        self, event: ChangeEvent, build: BuildRecord, reason: str | None = None
+    ) -> None:
+        await self.inner.eval_cancelled(event, build, reason)
 
     async def build_restarted(
         self, event: ChangeEvent, build: BuildRecord, attr: str | None

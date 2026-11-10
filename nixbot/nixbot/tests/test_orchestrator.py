@@ -134,6 +134,7 @@ class FakeExecutor:
         on_start: Callable[[], Awaitable[bool]] | None = None,
         on_built: Callable[[str], None] | None = None,
         identity: EffectIdentity | None = None,
+        stop_queued: asyncio.Event | None = None,
     ) -> BuildOutcome:
         if on_start is not None and not await on_start():
             return BuildOutcome.cancelled
@@ -148,6 +149,7 @@ class FakeExecutor:
 @dataclass
 class RecordingReporter:
     events: list[tuple] = field(default_factory=list)
+    results: list[BuildResult] = field(default_factory=list)
     started: asyncio.Event = field(default_factory=asyncio.Event)
 
     async def build_started(self, event: ChangeEvent, build: BuildRecord) -> None:
@@ -159,13 +161,20 @@ class RecordingReporter:
     ) -> None:
         self.events.append(("eval", build.id_, report.success, tuple(report.warnings)))
 
-    async def eval_cancelled(self, event: ChangeEvent, build: BuildRecord) -> None:
-        self.events.append(("eval-cancelled", build.id_))
+    async def eval_cancelled(
+        self, event: ChangeEvent, build: BuildRecord, reason: str | None = None
+    ) -> None:
+        self.events.append(
+            ("eval-cancelled", build.id_)
+            if reason is None
+            else ("eval-cancelled", build.id_, reason)
+        )
 
     async def build_finished(
         self, event: ChangeEvent, build: BuildRecord, result: BuildResult
     ) -> None:
         self.events.append(("finished", build.id_, result.status, result.generation))
+        self.results.append(result)
 
     async def build_restarted(
         self, event: ChangeEvent, build: BuildRecord, attr: str | None
@@ -3649,3 +3658,237 @@ async def test_reuse_of_terminal_tree_respects_protection(
         BuildStatus.SUCCEEDED if protected else BuildStatus.CANCELLED
     )
     assert await env.queued() == []
+
+
+# --- fail-fast branch builds ---------------------------------------------------
+
+
+def fail_fast_main(mode: str) -> str:
+    return f'[[fail_fast_branches]]\nmatch = "main"\nmode = "{mode}"\n'
+
+
+@dataclass
+class StreamingEvalRunner(FakeEvalRunner):
+    """Streams its jobs, then keeps evaluating until cancelled."""
+
+    stopped: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def run(
+        self,
+        worktree_path: Path,
+        branch_config: BranchConfig,
+        settings: EvalSettings,
+        on_jobs: object = None,
+        on_stderr_line: object = None,
+    ) -> EvalResult:
+        self.calls += 1
+        self.started.set()
+        settings.gc_roots_dir.mkdir(parents=True, exist_ok=True)
+        assert callable(on_jobs)
+        await on_jobs(list(self.jobs))
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.stopped.set()
+            raise
+        raise AssertionError  # unreachable
+
+
+@dataclass
+class StoppableExecutor(FakeExecutor):
+    """Other builds finish once every `held` build is running. Held
+    builds run until `release`, or until killed through their cancel
+    event. `unslotted` builds never get a slot: they wait for the
+    fail-fast stop, or build normally without one."""
+
+    held: set[str] = field(default_factory=set)
+    release: asyncio.Event = field(default_factory=asyncio.Event)
+    unslotted: set[str] = field(default_factory=set)
+    running: set[str] = field(default_factory=set)
+    held_running: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def build_attribute(  # noqa: PLR0913
+        self,
+        build_key: object,
+        job: NixEvalJobSuccess,
+        log_writer: LogWriter,
+        cwd: Path,
+        cancel_event: asyncio.Event | None = None,
+        on_start: Callable[[], Awaitable[bool]] | None = None,
+        on_built: Callable[[str], None] | None = None,
+        identity: EffectIdentity | None = None,
+        stop_queued: asyncio.Event | None = None,
+    ) -> BuildOutcome:
+        if job.attr in self.unslotted and stop_queued is not None:
+            await stop_queued.wait()
+            return BuildOutcome.cancelled
+        if on_start is not None and not await on_start():
+            return BuildOutcome.cancelled
+        self.built.append(job.attr)
+        if job.attr in self.held:
+            assert cancel_event is not None
+            self.running.add(job.attr)
+            if self.running >= self.held:
+                self.held_running.set()
+            killed = asyncio.ensure_future(cancel_event.wait())
+            released = asyncio.ensure_future(self.release.wait())
+            await asyncio.wait({killed, released}, return_when=asyncio.FIRST_COMPLETED)
+            killed.cancel()
+            released.cancel()
+            if cancel_event.is_set():
+                return BuildOutcome.cancelled
+        elif self.held:
+            await self.held_running.wait()
+        return self.outcomes.get(job.attr, BuildOutcome.success)
+
+
+async def attribute_errors(
+    pool: asyncpg.Pool, build_id: int
+) -> dict[str, tuple[str, str | None]]:
+    rows = await pool.fetch(
+        "SELECT attr, status, error FROM build_attributes WHERE build_id = $1",
+        build_id,
+    )
+    return {r["attr"]: (r["status"], r["error"]) for r in rows}
+
+
+async def test_fail_fast_cancel_stops_eval_and_fails_build(
+    pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
+) -> None:
+    sha = add_config_commit(upstream, fail_fast_main("cancel"))
+    eval_runner = StreamingEvalRunner(
+        [mk_job("a"), mk_job("b"), mk_job("c"), mk_job("d", deps=["b"])]
+    )
+    executor = StoppableExecutor(
+        outcomes={"a": BuildOutcome.failure}, held={"b"}, unslotted={"c"}
+    )
+    orchestrator, reporter, project = await make_env(eval_runner, executor, "ff-cancel")
+    build = await asyncio.wait_for(
+        orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha)
+        ),
+        timeout=10,
+    )
+    assert build is not None
+    assert eval_runner.stopped.is_set()
+    assert await build_status(pool, build.id_) == BuildStatus.FAILED
+    reason = "stopped: fail-fast after a"
+    rows = await attribute_errors(pool, build.id_)
+    assert rows["a"][0] == "failed"
+    # b was killed while running, c never got a slot, d waited on b.
+    assert rows["b"] == ("cancelled", reason)
+    assert rows["c"] == ("cancelled", reason)
+    assert rows["d"][0] == "cancelled"
+    assert ("eval-cancelled", build.id_, reason) in reporter.events
+    assert [(r.status, r.stop_reason) for r in reporter.results] == [
+        (BuildStatus.FAILED, reason)
+    ]
+    assert not any(e[:3] == ("eval", build.id_, False) for e in reporter.events)
+
+
+async def test_fail_fast_drain_keeps_running_result(
+    pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
+) -> None:
+    sha = add_config_commit(upstream, fail_fast_main("drain"))
+    eval_runner = StreamingEvalRunner([mk_job("a"), mk_job("b"), mk_job("c")])
+    executor = StoppableExecutor(
+        outcomes={"a": BuildOutcome.failure, "b": BuildOutcome.failure},
+        held={"b"},
+        unslotted={"c"},
+    )
+    orchestrator, _, project = await make_env(eval_runner, executor, "ff-drain")
+    task = asyncio.create_task(
+        orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha)
+        )
+    )
+    # The stop ends the eval and the unslotted build, not the running one.
+    await asyncio.wait_for(eval_runner.stopped.wait(), timeout=10)
+    assert not task.done()
+    executor.release.set()
+    build = await asyncio.wait_for(task, timeout=10)
+    assert build is not None
+    assert await build_status(pool, build.id_) == BuildStatus.FAILED
+    rows = await attribute_errors(pool, build.id_)
+    assert rows["a"][0] == "failed"
+    assert rows["b"][0] == "failed"
+    assert rows["c"] == ("cancelled", "stopped: fail-fast after a")
+
+
+async def test_restart_ignores_fail_fast(
+    pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
+) -> None:
+    sha = add_config_commit(upstream, fail_fast_main("cancel"))
+    executor = StoppableExecutor(outcomes={"a": BuildOutcome.failure}, unslotted={"c"})
+    orchestrator, _, project = await make_env(
+        FakeEvalRunner([mk_job("a"), mk_job("c")]), executor, "ff-restart"
+    )
+    build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha)
+    )
+    assert build is not None
+    assert (await attribute_errors(pool, build.id_))["c"][0] == "cancelled"
+
+    await orchestrator.reset_build_for_restart(build.id_, None)
+    record = await builds_q.get_build(pool, id_=build.id_)
+    assert record is not None
+    try:
+        async with orchestrator.rerun_worktree(project, record, "rerun", None) as (
+            event,
+            worktree_path,
+        ):
+            await orchestrator.run_build(event, record, worktree_path)
+    finally:
+        orchestrator.release_run(record.id_)
+    assert await attribute_statuses(pool, build.id_) == {
+        "a": "failed",
+        "c": "succeeded",
+    }
+    assert await build_status(pool, build.id_) == BuildStatus.FAILED
+
+
+async def test_pull_request_ignores_fail_fast(
+    pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
+) -> None:
+    sha = add_config_commit(upstream, fail_fast_main("cancel"))
+    executor = StoppableExecutor(outcomes={"a": BuildOutcome.failure}, unslotted={"c"})
+    orchestrator, _, project = await make_env(
+        FakeEvalRunner([mk_job("a"), mk_job("c")]), executor, "ff-pr"
+    )
+    build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=3)
+    )
+    assert build is not None
+    assert await attribute_statuses(pool, build.id_) == {
+        "a": "failed",
+        "c": "succeeded",
+    }
+
+
+async def test_fail_fast_releases_deferred_push(
+    protected_env: ProtectedEnvFactory, upstream: Path, pool: asyncpg.Pool
+) -> None:
+    """The stop ends a protected build early, so the push waiting
+    behind it is released right away."""
+    add_config_commit(upstream, PROTECT_MAIN + fail_fast_main("cancel"))
+    env = await protected_env("ff-protect")
+    eval_runner = StreamingEvalRunner([mk_job("a"), mk_job("b")])
+    env.orchestrator.eval_runner = eval_runner
+    env.executor.outcomes = {"a": BuildOutcome.failure}
+    env.executor.gate = asyncio.Event()
+    r_sha = add_commit(upstream, "r")
+    r_task = env.start(r_sha)
+    await asyncio.wait_for(env.executor.started.wait(), timeout=10)
+    d_sha = add_commit(upstream, "d")
+    await env.push(d_sha)
+    r_id, d_id = await env.build_id(r_sha), await env.build_id(d_sha)
+    assert await env.deferred() == [(d_id, r_id)]
+    # Without the stop, R's eval would never end.
+    env.executor.gate.set()
+    await asyncio.wait_for(r_task, timeout=10)
+    assert eval_runner.stopped.is_set()
+    assert await build_status(pool, r_id) == BuildStatus.FAILED
+    # Released through the work queue; the slot is held until D runs.
+    assert await env.queued() == [
+        ("change", f"change-github-id-{env.project.repo}-{d_sha}")
+    ]

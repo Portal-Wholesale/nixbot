@@ -83,7 +83,7 @@ if TYPE_CHECKING:
         JobBatchCallback,
         StderrLineCallback,
     )
-    from .repo_config import BranchConfig
+    from .repo_config import BranchConfig, FailFastMode
     from .running_effect import RunningEffect
     from .upload import Uploader
     from .workload_identity import EffectIdentity, IdentityIssuer
@@ -124,6 +124,7 @@ class AttributeExecutor(Protocol):
         on_start: Callable[[], Awaitable[bool]] | None = None,
         on_built: Callable[[str], None] | None = None,
         identity: EffectIdentity | None = None,
+        stop_queued: asyncio.Event | None = None,
     ) -> BuildOutcome: ...
 
 
@@ -503,7 +504,12 @@ class Orchestrator:
             return
         try:
             await self._run_build(
-                event, build, worktree_path, branch_config, credentials
+                event,
+                build,
+                worktree_path,
+                branch_config,
+                credentials,
+                fail_fast=self._fail_fast(event, branch_config),
             )
         finally:
             await self.finish_tracking(build.id_)
@@ -524,6 +530,19 @@ class Orchestrator:
             return None
         seconds = branch_config.protect_grace(event.branch)
         return None if seconds is None else timedelta(seconds=seconds)
+
+    def _fail_fast(
+        self, event: ChangeEvent, branch_config: BranchConfig | None
+    ) -> FailFastMode | None:
+        """Branch pushes only. Restarts never get here: they ask for
+        full results."""
+        if (
+            branch_config is None
+            or event.pr_number is not None
+            or event.tag is not None
+        ):
+            return None
+        return branch_config.fail_fast(event.branch)
 
     async def _incoming_stale(
         self, event: ChangeEvent, key: str, *, deferral: bool
@@ -603,13 +622,15 @@ class Orchestrator:
         transactional DB write, then the result is re-aggregated."""
         await self._run_build(event, build, worktree_path, None, credentials)
 
-    async def _run_build(
+    async def _run_build(  # noqa: PLR0913
         self,
         event: ChangeEvent,
         build: BuildRecord,
         worktree_path: Path,
         branch_config: BranchConfig | None,
         credentials: FetchCredentials | None,
+        *,
+        fail_fast: FailFastMode | None = None,
     ) -> None:
         """Without `branch_config` (restarts) it is read from the
         worktree. Either way the attribute is the one stored on the
@@ -619,7 +640,13 @@ class Orchestrator:
             branch_config = RepoBranchConfig.load(worktree_path)
         branch_config = branch_config.model_copy(update={"attribute": build.attribute})
         await build_run.run_build(
-            self, event, build, worktree_path, branch_config, credentials
+            self,
+            event,
+            build,
+            worktree_path,
+            branch_config,
+            credentials,
+            fail_fast=fail_fast,
         )
 
     async def deliver_events(

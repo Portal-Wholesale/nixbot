@@ -578,6 +578,62 @@ async def test_build_level_cancel_keeps_supersede_wording() -> None:
     assert combined.description == "build cancelled (superseded)"
 
 
+async def test_fail_fast_stop_reporting_names_the_trigger() -> None:
+    """A fail-fast stop is a failure caused by one attribute, never a
+    supersede: the summary names the trigger and every stopped
+    attribute says why it stopped."""
+    reason = "stopped: fail-fast after a"
+    reporter, poster, _ = make_reporter()
+    await reporter.eval_cancelled(EVENT, BUILD, reason)
+    await reporter.build_finished(
+        EVENT,
+        BUILD,
+        BuildResult(
+            "failed",
+            1,
+            [
+                attr_result("a", AttributeStatus.failed, error="error: boom"),
+                attr_result("b", AttributeStatus.cancelled, error=reason),
+                attr_result("c", AttributeStatus.succeeded),
+            ],
+            stop_reason=reason,
+        ),
+    )
+    by_context = {p.context: p for p in poster.posts}
+    assert by_context["nixbot/nix-eval"].state == StatusState.error
+    assert by_context["nixbot/nix-eval"].description == reason
+    summary = by_context["nixbot/nix-build"]
+    assert summary.state == StatusState.failure
+    assert summary.description == f"1 of 3 attributes failed, {reason}"
+    stopped = by_context[attr_status_context("github", "acme/widget", "b", "checks")]
+    assert stopped.description == reason
+    assert not any("superseded" in p.description for p in poster.posts)
+
+
+async def test_stopped_attributes_do_not_crowd_out_the_trigger() -> None:
+    """The report budget goes to real failures before cancelled ones."""
+    reason = "stopped: fail-fast after z"
+    reporter, poster, _ = make_reporter(limit=2)
+    await reporter.build_finished(
+        EVENT,
+        BUILD,
+        BuildResult(
+            "failed",
+            1,
+            [
+                *(
+                    attr_result(f"s{i}", AttributeStatus.cancelled, error=reason)
+                    for i in range(3)
+                ),
+                attr_result("z", AttributeStatus.failed, error="error: boom"),
+            ],
+            stop_reason=reason,
+        ),
+    )
+    trigger = attr_status_context("github", "acme/widget", "z", "checks")
+    assert trigger in {p.context for p in poster.posts}
+
+
 async def test_attribute_descriptions_are_ansi_stripped() -> None:
     """failure_excerpt keeps ANSI colors for the web UI. Forge statuses
     must not carry raw escape codes."""
