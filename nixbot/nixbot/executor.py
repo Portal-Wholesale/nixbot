@@ -32,7 +32,7 @@ import re
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import quote
 
 import zstandard
@@ -123,6 +123,23 @@ TRANSIENT_ERROR_MARKERS = (
     "writing to file: Broken pipe",
     "substituter",
 )
+
+
+class SlotScheduler(Protocol):
+    """The attribute slot pool NixBuildExecutor acquires from."""
+
+    async def acquire(self, key: object) -> None: ...
+
+    def release(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class SlotKey:
+    """A build's waiter key. FairScheduler only hashes it; priority
+    schedulers also read the priority."""
+
+    build_id: int
+    priority: int = 0
 
 
 class FairScheduler:
@@ -807,7 +824,7 @@ async def _pump_output(
 class NixBuildExecutor:
     """Builds attributes through the fair global queue."""
 
-    def __init__(self, queue: FairScheduler, settings: BuildSettings) -> None:
+    def __init__(self, queue: SlotScheduler, settings: BuildSettings) -> None:
         self.queue = queue
         self.settings = settings
 

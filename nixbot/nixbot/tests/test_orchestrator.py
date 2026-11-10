@@ -23,12 +23,12 @@ from nixbot.build_scheduler import (
     AttributeStatus,
     BuildOutcome,
 )
-from nixbot.config import Config
+from nixbot.config import BuildPriorityConfig, Config, PriorityRule
 from nixbot.db import BuildStatus
 from nixbot.db_gen import builds as builds_q
 from nixbot.effects import EffectMeta, EffectsContext
 from nixbot.events import BuildResult, ChangeEvent, EvalReport, RepoInfo
-from nixbot.executor import attribute_log_path, effect_run_log_path
+from nixbot.executor import SlotKey, attribute_log_path, effect_run_log_path
 from nixbot.gcroots import GcrootRegistrationError
 from nixbot.gitrepo import FetchCredentials, RepoManager
 from nixbot.memory import EvalWorkerConfig
@@ -123,6 +123,7 @@ class FakeExecutor:
     # When set, builds wait on this gate (for in-flight tests).
     gate: asyncio.Event | None = None
     started: asyncio.Event = field(default_factory=asyncio.Event)
+    build_keys: list[object] = field(default_factory=list)
 
     async def build_attribute(  # noqa: PLR0913
         self,
@@ -136,6 +137,7 @@ class FakeExecutor:
         identity: EffectIdentity | None = None,
         stop_queued: asyncio.Event | None = None,
     ) -> BuildOutcome:
+        self.build_keys.append(build_key)
         if on_start is not None and not await on_start():
             return BuildOutcome.cancelled
         self.built.append(job.attr)
@@ -668,6 +670,24 @@ async def test_pr_source_branch_selects_attribute(
     assert build is not None
     assert build.attribute == "checks"
     assert eval_runner.attributes == ["checks"]
+
+
+async def test_attribute_slot_key_carries_build_priority(
+    make_env: EnvFactory, upstream: Path
+) -> None:
+    executor = FakeExecutor()
+    orchestrator, _, project = await make_env(
+        FakeEvalRunner([mk_job("a")]), executor, name="slot-key"
+    )
+    rule = PriorityRule(match="main", events=["push"], priority=10)
+    orchestrator.config.build_priority = BuildPriorityConfig(rules=[rule])
+    build = await orchestrator.handle_change_event(
+        ChangeEvent(
+            repo=project, branch="main", commit_sha=git(upstream, "rev-parse", "HEAD")
+        )
+    )
+    assert build is not None
+    assert executor.build_keys == [SlotKey(build.id_, rule.priority)]
 
 
 async def test_same_tree_and_attribute_share_one_build(
