@@ -192,6 +192,35 @@ outputs).
 - **U8. Tribuchet hints (only if U7 shows hub queueing delays `main`).** A
   separate plan in the tribuchet fork.
 
+## U0 baseline (measured 2026-11-10)
+
+Nixbot API, `github/Portal-Wholesale/cms`, builds from 2026-11-08 to 2026-11-10:
+88 `main` push builds and 453 PR builds that reached evaluation. Eval wait is
+`started_at - created_at`. Attribute wait is attribute `started_at` minus the
+end of eval, for uncached attributes. It includes waiting on dependencies, and
+it cannot tell `FairScheduler` waits apart from hub waits.
+
+| `main` builds | n | p50 | p90 | max (s) |
+|---|---|---|---|---|
+| eval wait, all (PR builds overlapping) | 72 | 36 | 1419 | 7465 |
+| deferred behind a running `main` build: total wait | 71 | 33 | 1419 | 7465 |
+| deferred: wait after the blocking build finished | 71 | 6 | 19 | 7465 |
+| not deferred: eval-slot wait | 17 | 0 | 151 | 1362 |
+| attribute wait (PR builds overlapping) | 2028 | 0 | 407 | 4449 |
+| attribute wait (no PR builds overlapping) | 431 | 0 | 2 | 299 |
+
+- Most of `main`'s wait is `protect_running_branches` deferral: a push waits
+  for the previous `main` build to finish. Priority cannot remove that wait
+  directly. Attribute priority shortens it, because the blocking `main` build
+  finishes sooner.
+- A real eval-slot wait is a rare tail. About 5 of 88 builds waited 1–2h after
+  their blocker finished. Some of those may be superseded builds that were
+  bucketed wrongly.
+- PR builds wait about as long for attribute slots as `main` builds do (p90
+  1148s). Attributes build 3–7× slower while PR builds overlap. This hints at
+  queueing at the hub but does not prove it (see U7).
+- For U7, measure deferral separately from slot wait.
+
 ## Done when
 
 - With `build_priority` set, a `main` push that arrives while PR evals are
