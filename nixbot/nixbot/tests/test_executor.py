@@ -213,6 +213,30 @@ async def test_priority_ageing_promotes_waiting_key(
     assert order == expected
 
 
+async def test_priority_ageing_uses_oldest_waiter_of_key() -> None:
+    clock = FakeClock()
+    queue = FairPriorityScheduler(1, age_step_seconds=10, clock=clock)
+    order: list[str] = []
+    await queue.acquire(SlotKey(0))
+
+    async def worker(name: str, key: SlotKey) -> None:
+        await queue.acquire(key)
+        order.append(name)
+        queue.release()
+
+    # Key 1's oldest waiter has waited two steps by dispatch time, its
+    # newest none; the key must age by the oldest.
+    old = asyncio.create_task(worker("old", SlotKey(1)))
+    await asyncio.sleep(0)
+    clock.now = 25.0
+    new = asyncio.create_task(worker("new", SlotKey(1)))
+    high = asyncio.create_task(worker("high", SlotKey(2, priority=1)))
+    await asyncio.sleep(0)
+    queue.release()
+    await asyncio.gather(old, new, high)
+    assert order[0] == "old"
+
+
 async def test_priority_reserved_slots_refused_to_priority_zero() -> None:
     clock = FakeClock()
     queue = FairPriorityScheduler(2, reserved_slots=1, age_step_seconds=1, clock=clock)
