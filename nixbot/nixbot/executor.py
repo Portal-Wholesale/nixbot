@@ -821,46 +821,25 @@ class NixBuildExecutor:
         on_start: Callable[[], Awaitable[bool]] | None = None,
         on_built: Callable[[str], None] | None = None,
         identity: EffectIdentity | None = None,
+        stop_queued: asyncio.Event | None = None,
     ) -> BuildOutcome:
         """Run `nix build` for one attribute, with one automatic retry
         on transient errors (suppressed when cancellation is requested).
 
         on_start fires once a slot is acquired, right before nix runs;
         a False return (row already terminal) skips the build. on_built
-        receives each .drv nix ran a builder for."""
+        receives each .drv nix ran a builder for. stop_queued (a
+        fail-fast stop) cancels the attribute only while it waits for
+        a slot; once it holds one, the build runs to its own result."""
         cancel_event = cancel_event or asyncio.Event()
-        if cancel_event.is_set():
+        stop_queued = stop_queued or asyncio.Event()
+        if cancel_event.is_set() or stop_queued.is_set():
             return BuildOutcome.cancelled
         if not build_installables(job):
             # buildDependenciesOnly with all dependencies already present.
             return BuildOutcome.success
-        # A superseded build must not sit "building" until an unrelated
-        # build frees a slot: race the acquisition against the cancel.
-        acquire_task = asyncio.create_task(self.queue.acquire(build_key))
-        cancel_task = asyncio.create_task(cancel_event.wait())
-        try:
-            await asyncio.wait(
-                {acquire_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED
-            )
-        except asyncio.CancelledError:
-            # Cancelled in the same turn the slot was granted: give it
-            # back, nobody will run the build.
-            if acquire_task.done() and not acquire_task.cancelled():
-                self.queue.release()
-            raise
-        finally:
-            # Also runs on cancellation of this coroutine: a pending
-            # waiter (and its eventual slot) must not leak.
-            cancel_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await cancel_task
-            if not acquire_task.done():
-                acquire_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await acquire_task
-        if acquire_task.cancelled():
+        if not await self._acquire_slot(build_key, cancel_event, stop_queued):
             return BuildOutcome.cancelled
-        await acquire_task
         try:
             if on_start is not None and not await on_start():
                 return BuildOutcome.cancelled
@@ -882,6 +861,51 @@ class NixBuildExecutor:
             return outcome
         finally:
             self.queue.release()
+
+    async def _acquire_slot(
+        self,
+        build_key: object,
+        cancel_event: asyncio.Event,
+        stop_queued: asyncio.Event,
+    ) -> bool:
+        """Wait for a build slot. Returns whether one is held; False
+        when the cancel or the stop came first."""
+        # A superseded or stopped build must not sit "building" until an
+        # unrelated build frees a slot: race the acquisition against both.
+        acquire_task = asyncio.create_task(self.queue.acquire(build_key))
+        cancel_task = asyncio.create_task(cancel_event.wait())
+        stop_task = asyncio.create_task(stop_queued.wait())
+        try:
+            await asyncio.wait(
+                {acquire_task, cancel_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            # Cancelled in the same turn the slot was granted: give it
+            # back, nobody will run the build.
+            if acquire_task.done() and not acquire_task.cancelled():
+                self.queue.release()
+            raise
+        finally:
+            # Also runs on cancellation of this coroutine: a pending
+            # waiter (and its eventual slot) must not leak.
+            for task in (cancel_task, stop_task):
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            if not acquire_task.done():
+                acquire_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await acquire_task
+        if acquire_task.cancelled():
+            return False
+        await acquire_task
+        if stop_queued.is_set():
+            # Stopped in the same turn the slot was granted: nothing ran
+            # yet, so give the slot back.
+            self.queue.release()
+            return False
+        return True
 
     @contextlib.asynccontextmanager
     async def _store_env(

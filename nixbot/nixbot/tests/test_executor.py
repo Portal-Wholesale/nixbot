@@ -17,7 +17,7 @@ import pytest
 
 import nixbot.executor as executor_mod
 from nixbot.ansi import strip_ansi
-from nixbot.build_scheduler import BuildOutcome
+from nixbot.build_scheduler import BuildOutcome, FailFastStop
 from nixbot.config import BuildStoreConfig, Config
 from nixbot.executor import (
     FRAME_FLUSH_THRESHOLD,
@@ -291,6 +291,7 @@ case "$(cat "$control" 2>/dev/null)" in
   hang) sleep 60 ;;
   hangpid) echo $$ > {tmp_path}/pid; sleep 60 ;;
   racepid) echo $$ > {tmp_path}/pid; echo ok ;;
+  gated) while [ ! -e {tmp_path}/go ]; do sleep 0.02; done; echo ok ;;
   events) cat {tmp_path}/events ;;
   *) echo ok; exit 0 ;;
 esac
@@ -595,6 +596,137 @@ async def test_executor_task_cancelled_while_queued_releases_waiter(
         await queued
     queue.release()
     # The slot must be available again, not granted to the dead waiter.
+    await asyncio.wait_for(queue.acquire("c"), timeout=1)
+
+
+# --- fail-fast stop ---------------------------------------------------------
+
+
+async def test_executor_drain_finishes_running_and_cancels_queued(
+    tmp_path: Path, fake_nix: Path
+) -> None:
+    # Drain: the build holding the slot runs to its own result, the
+    # one waiting for a slot gives up, and no slot leaks.
+    fake_nix.write_text("gated")
+    queue = FairScheduler(1)
+    executor = NixBuildExecutor(queue, BuildSettings(log_dir=tmp_path))
+    stop = FailFastStop("drain")
+    started = asyncio.Event()
+
+    async def on_start() -> bool:
+        started.set()
+        return True
+
+    running_writer = LogWriter(path=tmp_path / "running.zst")
+    running = asyncio.create_task(
+        executor.build_attribute(
+            "b",
+            mk_job("running"),
+            running_writer,
+            tmp_path,
+            stop.stop_running,
+            on_start=on_start,
+            stop_queued=stop.stop_queued,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=5)
+    queued_writer = LogWriter(path=tmp_path / "queued.zst")
+    queued_started = asyncio.Event()
+
+    async def queued_on_start() -> bool:
+        queued_started.set()
+        return True
+
+    queued = asyncio.create_task(
+        executor.build_attribute(
+            "b",
+            mk_job("queued"),
+            queued_writer,
+            tmp_path,
+            stop.stop_running,
+            on_start=queued_on_start,
+            stop_queued=stop.stop_queued,
+        )
+    )
+    await asyncio.sleep(0.05)  # let it enqueue
+    assert stop.fire("bad")
+    assert await asyncio.wait_for(queued, timeout=2) == BuildOutcome.cancelled
+    assert not queued_started.is_set()
+    assert not running.done()
+
+    (tmp_path / "go").touch()
+    assert await asyncio.wait_for(running, timeout=5) == BuildOutcome.success
+    await running_writer.close()
+    await queued_writer.close()
+    # The only slot is free again, not held by the cancelled waiter.
+    await asyncio.wait_for(queue.acquire("c"), timeout=1)
+
+
+async def test_executor_cancel_stop_kills_running_build(
+    tmp_path: Path, fake_nix: Path
+) -> None:
+    fake_nix.write_text("hangpid")
+    pidfile = tmp_path / "pid"
+    queue = FairScheduler(1)
+    executor = NixBuildExecutor(queue, BuildSettings(log_dir=tmp_path))
+    stop = FailFastStop("cancel")
+    writer = LogWriter(path=tmp_path / "log.zst")
+    task = asyncio.create_task(
+        executor.build_attribute(
+            "b",
+            mk_job(),
+            writer,
+            tmp_path,
+            stop.stop_running,
+            stop_queued=stop.stop_queued,
+        )
+    )
+    while (  # noqa: ASYNC110 — polling an external file is the point
+        not pidfile.exists() or not pidfile.read_text().strip()
+    ):
+        await asyncio.sleep(0.01)
+    assert stop.fire("bad")
+    assert await asyncio.wait_for(task, timeout=5) == BuildOutcome.cancelled
+    await writer.close()
+    pid = int(pidfile.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    await asyncio.wait_for(queue.acquire("c"), timeout=1)
+
+
+async def test_executor_stop_in_same_turn_as_grant_returns_slot(
+    tmp_path: Path, fake_nix: Path
+) -> None:
+    # The stop fires in the same turn the slot is granted: nothing has
+    # run yet, so the attribute is cancelled and the slot goes back.
+    fake_nix.write_text("ok")
+    queue = FairScheduler(1)
+    executor = NixBuildExecutor(queue, BuildSettings(log_dir=tmp_path))
+    stop = FailFastStop("drain")
+    await queue.acquire("seed")  # occupy the only slot
+    started = asyncio.Event()
+
+    async def on_start() -> bool:
+        started.set()
+        return True
+
+    writer = LogWriter(path=tmp_path / "log.zst")
+    queued = asyncio.create_task(
+        executor.build_attribute(
+            "b",
+            mk_job(),
+            writer,
+            tmp_path,
+            on_start=on_start,
+            stop_queued=stop.stop_queued,
+        )
+    )
+    await asyncio.sleep(0.05)  # let it enqueue
+    queue.release()  # grants the waiter's slot...
+    stop.fire("bad")  # ...and the stop lands before it wakes
+    assert await asyncio.wait_for(queued, timeout=2) == BuildOutcome.cancelled
+    await writer.close()
+    assert not started.is_set()
     await asyncio.wait_for(queue.acquire("c"), timeout=1)
 
 
