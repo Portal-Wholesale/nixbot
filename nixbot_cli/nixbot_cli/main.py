@@ -483,6 +483,15 @@ def _match_attr(attrs: list[dict], selector: str) -> dict:
     return matches[0]
 
 
+def cmd_schedule_run(client: NixbotClient, args: argparse.Namespace) -> int:
+    repo = resolve_repo(client, args.repo)
+    run_id = client.run_schedule(repo, args.schedule, args.effect)["run_id"]
+    print(f"started {args.schedule}.{args.effect}: effect run {run_id}")
+    if not args.follow:
+        return EXIT_OK
+    return _log_effect(client, repo, run_id, args)
+
+
 def cmd_log(client: NixbotClient, args: argparse.Namespace) -> int:
     repo = resolve_repo(client, args.repo)
     if sum(x is not None for x in (args.attr, args.effect, args.effect_run)) > 1:
@@ -631,8 +640,9 @@ def follow_effect(
 def cmd_auth_status(client: NixbotClient, args: argparse.Namespace) -> int:
     settings = Settings.load()
     print(f"server: {settings.url}")
-    if settings.token:
-        print(f"token: {settings.token[:8]}… (NIXBOT_TOKEN or {config_path()})")
+    # fetch_token() also makes the reachability check below send the token.
+    if token := settings.token or client.fetch_token():
+        print(f"token: {token[:8]}… (NIXBOT_TOKEN or {config_path()})")
     else:
         print("token: none (anonymous). Set NIXBOT_TOKEN for control commands.")
     client.repos()  # verifies the server answers and the token is accepted
@@ -824,6 +834,27 @@ running ones. Piped or in CI it prints one line per finished attribute.""",
     _add_json_arg(log)
     log.set_defaults(func=cmd_log)
 
+    schedule = sub.add_parser(
+        "schedule", help="run onSchedule effects on the server"
+    ).add_subparsers(dest="subcommand", required=True)
+    s_run = schedule.add_parser(
+        "run",
+        help="start a scheduled effect now (repo admins)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  nbo schedule run flake-update update      run the schedule's update effect now
+  nbo schedule run flake-update update -f   and stream its log, exit 1 if it fails
+
+To run it on this machine instead, see nbo effects run-scheduled.""",
+    )
+    s_run.add_argument("schedule", help="schedule name (herculesCI.onSchedule.<name>)")
+    s_run.add_argument("effect", help="effect within the schedule")
+    _add_repo_arg(s_run)
+    s_run.add_argument(
+        "-f", "--follow", action="store_true", help="stream the run's log"
+    )
+    s_run.set_defaults(func=cmd_schedule_run, tail=None, json=None)
+
     auth = sub.add_parser("auth", help="authentication").add_subparsers(
         dest="subcommand", required=True
     )
@@ -835,9 +866,15 @@ running ones. Piped or in CI it prints one line per finished attribute.""",
     return parser
 
 
-def make_client() -> NixbotClient:
-    settings = Settings.load()
-    return NixbotClient(settings.url, settings.token)
+def make_client(args: argparse.Namespace) -> NixbotClient:
+    # -R (or `repo enable/disable REPO`) can pick the server, see Settings.load.
+    settings = Settings.load(
+        getattr(args, "repo", None) or getattr(args, "repository", None)
+    )
+    token = settings.token or (
+        settings.resolve_token if settings.token_command else None
+    )
+    return NixbotClient(settings.url, token)
 
 
 def main(argv: Sequence[str] | None = None) -> NoReturn:
@@ -845,7 +882,7 @@ def main(argv: Sequence[str] | None = None) -> NoReturn:
     try:
         # Effects commands drive nix locally and need no API client.
         if getattr(args, "needs_client", True):
-            with make_client() as client:
+            with make_client(args) as client:
                 code = args.func(client, args)
         else:
             code = args.func(args)

@@ -336,6 +336,38 @@ async def test_build_success_enqueues_delivery(env: dict[str, Any]) -> None:
     assert set(await _rows(svc, env["build_id"])) == {"plan", "preview"}
 
 
+async def test_settled_build_delivers_once(env: dict[str, Any]) -> None:
+    """A head reusing a build has no build record of its own, so startup
+    reconciliation and redelivered webhooks settle it again."""
+    svc, pool = env["service"], env["service"].pool
+    build = await builds_q.get_build(pool, id_=env["build_id"])
+    project = await svc.repo_store.by_id(env["project_id"])
+    assert build is not None
+    assert project is not None
+    event = ChangeEvent(
+        repo=repo_info(project),
+        branch="main",
+        commit_sha=env["sha"],
+        pr_number=7,
+        actor="github:alice",
+    )
+    for _ in range(2):
+        await svc.orchestrator.deliver_events(event, build)
+        await svc.drain_work()
+    assert sorted(n for _k, n, _p, _c in env["ran"]) == ["plan"]
+
+    # The same build settling for another commit is a new event.
+    env["listings"]["build_finished"]["release"] = EventEffectMeta()
+    git(env["repo"], "commit", "--allow-empty", "-m", "merge")
+    merge = git(env["repo"], "rev-parse", "HEAD").strip()
+    for rev in (env["sha"], env["sha"], merge):
+        push = replace(event, pr_number=None, commit_sha=rev)
+        await svc.orchestrator.deliver_events(push, build)
+        await svc.drain_work()
+    released = [p["build"]["rev"] for _k, n, p, _c in env["ran"] if n == "release"]
+    assert released == [env["sha"], merge]
+
+
 async def test_comment_and_close_webhooks_deliver(env: dict[str, Any]) -> None:
     svc, build_id, pool = env["service"], env["build_id"], env["service"].pool
     forge_repo_id = await pool.fetchval(
@@ -461,6 +493,26 @@ async def test_build_finished_transitions(env: dict[str, Any]) -> None:
     assert (await _rows(svc, pr_red))["fixed"]["skip_reason"] == (
         "not a fixed transition (succeeded -> failed)"
     )
+
+
+async def test_build_finished_names_the_pushed_commit(env: dict[str, Any]) -> None:
+    """build_finished names the pushed commit, not the build's stored one."""
+    svc, pool = env["service"], env["service"].pool
+    env["listings"]["build_finished"]["release"] = EventEffectMeta(
+        when={"branches": ["main"]}
+    )
+    built_by_pr = await insert_build(
+        pool,
+        env["project_id"],
+        number=20,
+        commit_sha="pr-head",
+        tree_hash="r1",
+        status="succeeded",
+    )
+    await _finish(svc, env, built_by_pr)
+    [build] = [p["build"] for _k, n, p, _ in env["ran"] if n == "release"]
+    assert (build["number"], build["rev"]) == (20, env["sha"])
+    assert "pullRequest" not in env["ran"][-1][2]
 
 
 async def test_command_while_running_gets_notice(env: dict[str, Any]) -> None:

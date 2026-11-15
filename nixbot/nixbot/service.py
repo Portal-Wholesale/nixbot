@@ -23,8 +23,8 @@ from .db_gen import approvals as approvals_q
 from .db_gen import builds as builds_q
 from .db_gen import deferred as deferred_q
 from .db_gen import events as ev_q
-from .db_gen import failed as failed_q
 from .db_gen import maintenance as q
+from .db_gen import statuses as statuses_q
 from .deliver import Delivery, EventListingCache, deliver
 from .event_effects import restart_event_effect
 from .events import (
@@ -72,13 +72,14 @@ from .work_queue import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine, Sequence
+    from collections.abc import AsyncIterator, Coroutine, Sequence
 
     import asyncpg
 
     from .approval import GatePoster
     from .config import Config
     from .db import BuildRecord
+    from .db_gen.models import Project
     from .forge import GiteaClient, GitHubAppClient, GitlabClient
     from .orchestrator import Orchestrator
     from .polling import PolledRepository
@@ -101,11 +102,13 @@ class PullBasedCredentialsProvider:
     def __init__(self, repos: list[PolledRepository]) -> None:
         self._by_url = {repo.url: repo for repo in repos}
 
-    async def get(self, repo_url: str) -> FetchCredentials:
+    @contextlib.asynccontextmanager
+    async def scoped(self, repo_url: str) -> AsyncIterator[FetchCredentials]:
         repo = self._by_url.get(repo_url)
         if repo is None:
-            return FetchCredentials()
-        return FetchCredentials(
+            yield FetchCredentials()
+            return
+        yield FetchCredentials(
             ssh_private_key_file=repo.ssh_private_key_file,
             ssh_known_hosts_file=repo.ssh_known_hosts_file,
         )
@@ -234,6 +237,11 @@ class CIService:
 
     def credentials_provider(self, forge: str) -> CredentialsProvider:
         return self.credentials_providers.get(forge, _STATIC_CREDENTIALS)
+
+    def fetch_credentials(
+        self, info: RepoInfo
+    ) -> contextlib.AbstractAsyncContextManager[FetchCredentials]:
+        return self.credentials_provider(info.forge).scoped(info.clone_url)
 
     def _spawn(self, coro: Coroutine[None, None, object]) -> asyncio.Task:
         task = asyncio.create_task(coro)
@@ -367,14 +375,17 @@ class CIService:
             if build is None or build.project_id != project.id_:
                 build_id = None
         if build_id is None:
-            build_id = await failed_q.latest_build_for_sha(
+            build_id = await statuses_q.latest_build_for_sha(
                 self.pool, project_id=project.id_, commit_sha=event.head_sha
             )
         if build_id is None:
             return
         if event.name is not None:
-            row = await failed_q.check_run_attr(
-                self.pool, project_id=project.id_, sha=event.head_sha, name=event.name
+            row = await statuses_q.get_commit_status(
+                self.pool,
+                project_id=project.id_,
+                sha=event.head_sha,
+                context=event.name,
             )
             if row is not None and row.attr is not None:
                 await self.restart_attribute(build_id, row.attr)
@@ -438,13 +449,7 @@ class CIService:
             },
         )
         if self.gate_poster is not None:
-            await self.gate_poster.post_gate(
-                info.owner,
-                info.repo,
-                change.commit_sha,
-                pr_number,
-                f"{self.config.url.rstrip('/')}/repos/{info.forge}/{info.name}",
-            )
+            await self.gate_poster.approval_required(info, change.commit_sha, pr_number)
         return True
 
     async def _process_change(
@@ -454,7 +459,20 @@ class CIService:
         if project is None or not project.enabled:
             return
         info = repo_info(project)
-        credentials = await self.credentials_provider(info.forge).get(info.clone_url)
+        async with self.fetch_credentials(info) as credentials:
+            await self._process_change_scoped(
+                project, info, change, credentials, last_attempt=last_attempt
+            )
+
+    async def _process_change_scoped(
+        self,
+        project: Project,
+        info: RepoInfo,
+        change: ChangeRequest,
+        credentials: FetchCredentials,
+        *,
+        last_attempt: bool,
+    ) -> None:
         if change.pr_number is not None and await self._gated(
             project.id_, change.pr_number, info, change, credentials
         ):
@@ -598,7 +616,7 @@ class CIService:
 
     async def run_scheduled_now(
         self, project_id: int, schedule_name: str, effect: str, when_spec: str
-    ) -> None:
+    ) -> int:
         """Manually trigger an onSchedule effect from the UI.
 
         The run row is created synchronously so the UI shows it running
@@ -624,6 +642,7 @@ class CIService:
                 "run_id": run_id,
             },
         )
+        return run_id
 
     async def enqueue_work(
         self, kind: str, dedup_key: str, payload: dict[str, Any], *, delay: float = 0
@@ -789,25 +808,25 @@ class CIService:
         if project is None:
             return
         info = repo_info(project)
-        credentials = await self.credentials_provider(info.forge).get(info.clone_url)
-        try:
-            await self.orchestrator.run_effect_item(
-                info, build, name, kind, credentials
-            )
-        except Exception as e:
-            # Setup failures (fetch/checkout) happen before the
-            # runner settles the row.
-            await builds_q.finish_effect(
-                self.pool,
-                build_id=build_id,
-                kind=kind,
-                name=name,
-                status="failed",
-                error=str(e) or type(e).__name__,
-                log_size=0,
-                log_truncated=False,
-            )
-            raise
+        async with self.fetch_credentials(info) as credentials:
+            try:
+                await self.orchestrator.run_effect_item(
+                    info, build, name, kind, credentials
+                )
+            except Exception as e:
+                # Setup failures (fetch/checkout) happen before the
+                # runner settles the row.
+                await builds_q.finish_effect(
+                    self.pool,
+                    build_id=build_id,
+                    kind=kind,
+                    name=name,
+                    status="failed",
+                    error=str(e) or type(e).__name__,
+                    log_size=0,
+                    log_truncated=False,
+                )
+                raise
 
     async def recover_unfinished_builds(self) -> None:
         """Crash recovery: settle already-built attributes, then queue

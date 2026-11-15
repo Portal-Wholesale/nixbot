@@ -29,7 +29,12 @@ from nixbot.events import BuildResult, NullStatusReporter
 from nixbot.forge import DiscoveredRepo
 from nixbot.schedule_runner import scheduled_worktree_id
 from nixbot.schedules import DueEffect, ScheduleWhen
-from nixbot.status import CheckRunStore, FailedStatusStore, ForgeStatusReporter
+from nixbot.status import (
+    CommitStatusStore,
+    ForgeStatusReporter,
+    PostedStatus,
+    StatusState,
+)
 from nixbot.webhooks import (
     BranchDeleted,
     ChangeRequest,
@@ -46,6 +51,7 @@ from .support import (
     insert_project,
     make_config,
     mk_job,
+    wait_started,
 )
 
 if TYPE_CHECKING:
@@ -53,6 +59,7 @@ if TYPE_CHECKING:
 
     from fastapi import FastAPI
 
+    from nixbot.events import RepoInfo
     from nixbot.service import CIService
 
 pytestmark = pytest.mark.usefixtures("fresh_work_queue")
@@ -411,8 +418,8 @@ async def test_pr_approval_gate(
         handled.append((event.pr_number, event.commit_sha))
 
     class FakeGate:
-        async def post_gate(
-            self, owner: str, repo: str, sha: str, pr_number: int, details_url: str
+        async def approval_required(
+            self, repo: RepoInfo, sha: str, pr_number: int
         ) -> None:
             gates.append((sha, pr_number))
 
@@ -902,7 +909,7 @@ async def test_restart_attribute_while_build_running(
             repo_info(project), build, [mk_job("a"), mk_job("b")]
         )
     )
-    await asyncio.wait_for(executor.started.wait(), timeout=10)
+    await wait_started(executor.started, run)
 
     await service.restart_attribute(build_id, "a")
     drain = asyncio.create_task(service.drain_work())
@@ -982,9 +989,16 @@ async def test_check_rerequested_dispatch(service: CIService) -> None:
         "VALUES ($1, 'flaky', 'x86_64-linux', 'failed')",
         build_id,
     )
-    store = CheckRunStore(pool)
-    await store.set(project_id, "deadbeef", "nixbot/nix-build", None, 1)
-    await store.set(project_id, "deadbeef", "nixbot/nix-build a", "flaky", 2)
+    store = CommitStatusStore(pool)
+    await store.set(
+        project_id, "deadbeef", "nixbot/nix-build", PostedStatus(StatusState.success)
+    )
+    await store.set(
+        project_id,
+        "deadbeef",
+        "nixbot/nix-build a",
+        PostedStatus(StatusState.failure, "flaky"),
+    )
 
     calls: list[tuple[int, str | None]] = []
 
@@ -1101,7 +1115,7 @@ async def test_re_report_uses_the_stored_attribute(service: CIService) -> None:
             contexts.append(context)
 
     service.orchestrator.reporter = ForgeStatusReporter(
-        {"github": Poster()}, FailedStatusStore(pool), "https://ci.test"
+        {"github": Poster()}, CommitStatusStore(pool), "https://ci.test"
     )
 
     await service._re_report(build_id)  # noqa: SLF001

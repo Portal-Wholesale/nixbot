@@ -152,7 +152,8 @@ class ChangeRequest:
     author_association: str | None = None
     # PR head branch lives in the base repository (not a fork).
     head_in_base_repo: bool = False
-    # PR head branch name.
+    # PR head branch name. Matched by attribute rules' source_match, and
+    # PRs based on it build after it, see ClaimNextWorkItem.
     head_ref: str | None = None
     # Tag pushes: the tag name, also in `branch` so the build gets its
     # own context. commit_sha may be an annotated tag object until the
