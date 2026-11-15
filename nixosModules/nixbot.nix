@@ -508,15 +508,6 @@ in
       description = "Number of nix-eval-jobs worker processes; null uses the core count.";
     };
 
-    evalConcurrency = lib.mkOption {
-      type = lib.types.ints.positive;
-      default = 1;
-      description = ''
-        Evaluations that may run at once across all repositories. Each runs
-        `evalWorkerCount` workers of up to `evalMaxMemorySize` MiB.
-      '';
-    };
-
     showTrace = lib.mkOption {
       type = lib.types.bool;
       default = false;

@@ -8,14 +8,13 @@ only made sense for the buildbot master/worker split are gone.
 
 from __future__ import annotations
 
-import fnmatch
 import hashlib
 import json
 import os
 import re
 from collections.abc import Callable, Mapping  # noqa: TC003
 from dataclasses import dataclass
-from fnmatch import fnmatch
+from fnmatch import fnmatch, fnmatchcase
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 from urllib.parse import urlsplit
@@ -245,7 +244,7 @@ class BuildStoreConfig(BaseModel):
     def serves(self, repo: str) -> bool:
         if not self.repos:
             return True
-        return any(fnmatch.fnmatchcase(repo, pattern) for pattern in self.repos)
+        return any(fnmatchcase(repo, pattern) for pattern in self.repos)
 
 
 class MachinesConfig(BaseModel):
