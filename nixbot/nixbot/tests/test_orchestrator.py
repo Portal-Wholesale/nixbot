@@ -3944,6 +3944,7 @@ class StoppableExecutor(FakeExecutor):
         on_built: Callable[[str], None] | None = None,
         identity: EffectIdentity | None = None,
         stop_queued: asyncio.Event | None = None,
+        store: BuildStoreConfig | None = None,
     ) -> BuildOutcome:
         if job.attr in self.unslotted and stop_queued is not None:
             await stop_queued.wait()

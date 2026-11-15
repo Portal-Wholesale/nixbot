@@ -715,6 +715,8 @@ class ForgeStatusReporter:
                 build.attribute,
                 context_prefix=self.context_prefix,
             )
+            repo_id, sha = event.repo.id, event.commit_sha
+            before = await self.statuses.get(repo_id, sha, context)
             await self._post(
                 event,
                 build,
@@ -724,6 +726,22 @@ class ForgeStatusReporter:
                 attr=attr,
                 force_new=True,
             )
+            # Keep a restarted failure on record as failed, under the new
+            # run, so the rerun's success flips it (the store keeps one
+            # state per context, and pending would hide the failure).
+            after = await self.statuses.get(repo_id, sha, context)
+            if (
+                before is not None
+                and before.state is StatusState.failure
+                and after is not None
+                and after.state is StatusState.pending
+            ):
+                await self.statuses.set(
+                    repo_id,
+                    sha,
+                    context,
+                    PostedStatus(StatusState.failure, attr, after.run_id),
+                )
         await self._post(
             event,
             build,
