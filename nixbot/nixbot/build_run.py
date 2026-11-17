@@ -397,7 +397,7 @@ async def _with_build_store(
     stack: contextlib.AsyncExitStack,
 ) -> EvalSettings:
     """Send IFD builds to the build store, authenticated like attribute builds."""
-    store = o.config.build_store
+    store = o.config.store_for(event.repo.name)
     if store is None:
         return settings
     settings = dataclasses.replace(
@@ -855,6 +855,7 @@ class _OrchestratorExecutor:
                         self.event, "build", self.build_record.id_
                     ),
                     stop_queued=None if stop is None else stop.stop_queued,
+                    store=self.o.config.store_for(self.event.repo.name),
                 )
                 if outcome == BuildOutcome.success:
                     outcome = await self._after_success(job, writer)

@@ -74,7 +74,7 @@ if TYPE_CHECKING:
     import asyncpg
 
     from .build_scheduler import BuildOutcome, FailedBuildCache
-    from .config import Config
+    from .config import BuildStoreConfig, Config
     from .db import BuildRecord
     from .db_gen.models import DeferredChange
     from .gitrepo import FetchCredentials, RepoManager
@@ -127,6 +127,7 @@ class AttributeExecutor(Protocol):
         on_built: Callable[[str], None] | None = None,
         identity: EffectIdentity | None = None,
         stop_queued: asyncio.Event | None = None,
+        store: BuildStoreConfig | None = None,
     ) -> BuildOutcome: ...
 
 
@@ -682,6 +683,7 @@ class Orchestrator:
             "build_id": build.id_,
             "actor": event.actor,
             "pr_number": event.pr_number,
+            "once": True,
         }
         if event.pr_number is not None and build.status == BuildStatus.SUCCEEDED:
             await queue.enqueue("deliver", key, {"kind": "pull_request", **base})
@@ -696,6 +698,7 @@ class Orchestrator:
                 {
                     "kind": "build_finished",
                     **base,
+                    "rev": event.commit_sha,
                     "previous_status": previous,
                     "failed_attrs": list(failed),
                 },

@@ -585,8 +585,12 @@ def build_installables(job: NixEvalJobSuccess) -> list[str]:
 
 
 def build_nix_command(
-    job: NixEvalJobSuccess, settings: BuildSettings, out_link: Path
+    job: NixEvalJobSuccess,
+    settings: BuildSettings,
+    out_link: Path,
+    store: BuildStoreConfig | None = None,
 ) -> list[str]:
+    store = store if store is not None else settings.store
     return [
         "nix",
         "build",
@@ -611,8 +615,8 @@ def build_nix_command(
         "--accept-flake-config",
         *settings.extra_args,
         *(
-            ["--store", settings.store.url, "--eval-store", "auto"]
-            if settings.store
+            ["--store", store.url, "--eval-store", "auto"]
+            if store
             else ["--out-link", str(out_link)]
         ),
         *build_installables(job),
@@ -1034,6 +1038,7 @@ class NixBuildExecutor:
         on_built: Callable[[str], None] | None = None,
         identity: EffectIdentity | None = None,
         stop_queued: asyncio.Event | None = None,
+        store: BuildStoreConfig | None = None,
     ) -> BuildOutcome:
         """Run `nix build` for one attribute, with one automatic retry
         on transient errors (suppressed when cancellation is requested).
@@ -1044,6 +1049,7 @@ class NixBuildExecutor:
         fail-fast stop) cancels the attribute only while it waits for
         a slot; once it holds one, the build runs to its own result."""
         cancel_event = cancel_event or asyncio.Event()
+        store = store if store is not None else self.settings.store
         stop_queued = stop_queued or asyncio.Event()
         if cancel_event.is_set() or stop_queued.is_set():
             return BuildOutcome.cancelled
@@ -1056,7 +1062,7 @@ class NixBuildExecutor:
             if on_start is not None and not await on_start():
                 return BuildOutcome.cancelled
             outcome, transient = await self._run_once(
-                job, log_writer, cwd, cancel_event, on_built, identity
+                job, log_writer, cwd, cancel_event, on_built, identity, store
             )
             if outcome == BuildOutcome.failure and transient:
                 if cancel_event.is_set():
@@ -1068,7 +1074,7 @@ class NixBuildExecutor:
                     b"\n\nnixbot: transient error detected, retrying once\n\n"
                 )
                 outcome, _ = await self._run_once(
-                    job, log_writer, cwd, cancel_event, on_built, identity
+                    job, log_writer, cwd, cancel_event, on_built, identity, store
                 )
             return outcome
         finally:
@@ -1121,10 +1127,10 @@ class NixBuildExecutor:
 
     @contextlib.asynccontextmanager
     async def _store_env(
-        self, identity: EffectIdentity | None
+        self, identity: EffectIdentity | None, store: BuildStoreConfig | None
     ) -> AsyncIterator[dict[str, str] | None]:
         """Environment pointing nix at a token file that is kept fresh."""
-        store, issuer = self.settings.store, self.settings.issuer
+        issuer = self.settings.issuer
         if store is None or store.oidc_audience is None:
             yield None
             return
@@ -1142,12 +1148,13 @@ class NixBuildExecutor:
         cancel_event: asyncio.Event,
         on_built: Callable[[str], None] | None = None,
         identity: EffectIdentity | None = None,
+        store: BuildStoreConfig | None = None,
     ) -> tuple[BuildOutcome, bool]:
         if cancel_event.is_set():
             return BuildOutcome.cancelled, False
         out_link = cwd / f"result-{safe_attr_filename(job.attr)}"
-        cmd = build_nix_command(job, self.settings, out_link)
-        async with self._store_env(identity) as env:
+        cmd = build_nix_command(job, self.settings, out_link, store)
+        async with self._store_env(identity, store) as env:
             return await self._run_nix(
                 cmd, env, job, log_writer, cwd, cancel_event, on_built
             )

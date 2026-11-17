@@ -74,6 +74,11 @@ async def postgres_dsn(postgres_dsn: str) -> str:
             "VALUES ((SELECT project_id FROM builds WHERE id = $1), 'push', $1, 'deploy', 'failed'), ((SELECT project_id FROM builds WHERE id = $1), 'push', $1, 'notify', 'dependency_failed')",
             failed,
         )
+        await pool.execute(
+            "INSERT INTO scheduled_effects (project_id, schedule_name, effect, when_spec)"
+            " VALUES ($1, 'flake-update', 'update', '{}')",
+            project_id,
+        )
     return postgres_dsn
 
 
@@ -434,11 +439,70 @@ def test_settings_token_command(
     hosts.write_text(
         '["https://ci.example.org"]\ntoken_command = "echo bnix_from_pass"\n'
     )
-    assert Settings.load().token == "bnix_from_pass"
+    assert Settings.load().resolve_token() == "bnix_from_pass"
 
+    # The command runs only when a token is needed, so a broken or locked
+    # secret manager does not stop read-only commands.
     hosts.write_text('["https://ci.example.org"]\ntoken_command = "false"\n')
+    settings = Settings.load()
+    assert settings.token is None
     with pytest.raises(ValueError, match="token_command"):
-        Settings.load()
+        settings.resolve_token()
+
+
+def test_token_command_runs_only_for_control(harness: WebHarness) -> None:
+    """Reads go out anonymously. The token is fetched once, for the first
+    request that changes state."""
+    store = harness.ctx.token_store
+    assert store is not None
+    token = harness.run(store.create(ROOT, "lazy"))
+    calls: list[str] = []
+
+    def fetch() -> str:
+        calls.append("fetch")
+        return token
+
+    client = NixbotClient(token=fetch, http=make_client(harness).http)
+    assert client.build(REPO, 1)["build"]["number"] == 1
+    assert calls == []
+    assert client.restart_build(REPO, 1)["action"] == "restart"
+    assert client.restart_build(REPO, 1)["action"] == "restart"
+    assert calls == ["fetch"]
+
+
+def test_settings_server_for_repo_arg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """-R picks the server whose `remotes` pattern covers that repository,
+    wherever nbo runs. A pattern without an owner part cannot speak for
+    an owner/name and is skipped."""
+    monkeypatch.delenv("NIXBOT_URL", raising=False)
+    monkeypatch.delenv("NIXBOT_TOKEN", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    hosts = tmp_path / "nixbot" / "hosts.toml"
+    hosts.parent.mkdir(parents=True)
+    hosts.write_text(
+        '["https://ci.other.org"]\nremotes = ["git.other.org/*"]\n'
+        '["https://ci.example.org"]\nremotes = ["github.com/acme/*"]\n'
+    )
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", "-C", str(tmp_path), *args], check=True)  # noqa: S603
+
+    git("init", "-q")
+    git("remote", "add", "origin", "https://git.other.org/team/thing")
+    git("config", "nixbot.url", "https://ci.other.org")
+    monkeypatch.chdir(tmp_path)
+
+    # The checkout belongs to ci.other.org, but -R names an acme repository.
+    assert Settings.load("acme/widget").url == "https://ci.example.org"
+    assert Settings.load("github/Acme/widget").url == "https://ci.example.org"
+    # Without a matching pattern the checkout's own settings still apply.
+    assert Settings.load("nobody/nothing").url == "https://ci.other.org"
+    assert Settings.load().url == "https://ci.other.org"
+    # NIXBOT_URL still wins.
+    monkeypatch.setenv("NIXBOT_URL", "https://ci.env.org")
+    assert Settings.load("acme/widget").url == "https://ci.env.org"
 
 
 def test_log_follow_finished_attr_falls_back_to_stored_log(
@@ -764,6 +828,48 @@ def test_follow_effect_exit_code_waits_for_the_final_status(
     )
     assert cli.cmd_log(_client(handler), args) == cli.EXIT_BUILD_FAILED
     assert capsys.readouterr().out == "boom\n"
+
+
+def test_schedule_run(api: NixbotClient, capsys: pytest.CaptureFixture[str]) -> None:
+    assert (
+        run_cli(api, "schedule", "run", "flake-update", "update", "-R", str(REPO))
+        == cli.EXIT_OK
+    )
+    run_id = len(BACKEND.scheduled_runs)
+    assert BACKEND.scheduled_runs[-1][1:3] == ("flake-update", "update")
+    out = capsys.readouterr().out
+    assert out == f"started flake-update.update: effect run {run_id}\n"
+
+
+def test_schedule_run_follow_exits_with_the_runs_status(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--follow streams the new run's log and exits like `nbo log -f`."""
+    statuses = iter(["running", "failed"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            assert request.url.path == (
+                "/api/repos/github/acme/widget/schedules/flake-update/effects/update/run"
+            )
+            return httpx.Response(
+                200,
+                json={"run_id": 9, "action": "run"},
+            )
+        assert "/effects/runs/9" in request.url.path
+        if request.url.path.endswith("/stream"):
+            return httpx.Response(
+                200,
+                content='event: text\ndata: {"text":"updating\\n"}\n\nevent: done\ndata: {}\n\n',
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(200, json={"id": 9, "status": next(statuses)})
+
+    args = cli.build_parser().parse_args(
+        ["schedule", "run", "flake-update", "update", "-f", "-R", "github/acme/widget"]
+    )
+    assert cli.cmd_schedule_run(_client(handler), args) == cli.EXIT_BUILD_FAILED
+    assert capsys.readouterr().out.endswith("updating\n")
 
 
 def test_log_effect_without_log_says_why(

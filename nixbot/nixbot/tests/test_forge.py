@@ -42,7 +42,6 @@ from nixbot.status import (
     GitHubCheckRunPoster,
     StatusState,
 )
-from nixbot.tests.test_status import _MemoryCheckRunIds
 
 from .support import (
     FakeGitea,
@@ -206,13 +205,16 @@ async def test_github_discovery(github_client: GitHubAppClient) -> None:
 async def test_github_fetch_credentials(github_client: GitHubAppClient) -> None:
     await github_client.discover_repos()
     provider = GitHubFetchCredentialsProvider(github_client)
-    creds = await provider.get("https://github.com/acme/repo22.git")
-    assert creds.netrc_file is not None
-    content = creds.netrc_file.read_text()
+    async with provider.scoped("https://github.com/acme/repo22.git") as creds:
+        assert creds.netrc_file is not None
+        content = creds.netrc_file.read_text()
     assert "x-access-token" in content
     assert "ghs_token_22" in content
+    # The token file must not outlive its use.
+    assert not creds.netrc_file.exists()
     # Unknown repo: no credentials (public/netrc fallback).
-    assert (await provider.get("https://github.com/other/x.git")).netrc_file is None
+    async with provider.scoped("https://github.com/other/x.git") as creds:
+        assert creds.netrc_file is None
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl required")
@@ -222,9 +224,9 @@ async def test_github_fetch_credentials_enterprise_host(
     # The netrc machine entry must match the host git fetches from.
     await github_client.discover_repos()
     provider = GitHubFetchCredentialsProvider(github_client)
-    creds = await provider.get("https://ghe.example.com/acme/repo22.git")
-    assert creds.netrc_file is not None
-    assert "machine ghe.example.com " in creds.netrc_file.read_text()
+    async with provider.scoped("https://ghe.example.com/acme/repo22.git") as creds:
+        assert creds.netrc_file is not None
+        assert "machine ghe.example.com " in creds.netrc_file.read_text()
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl required")
@@ -269,8 +271,8 @@ async def test_github_fetch_credentials_repo_scoped(
 
     await github_client.discover_repos()
     provider = GitHubFetchCredentialsProvider(github_client)
-    creds = await provider.get("https://github.com/acme/repo22.git")
-    assert creds.token is not None
+    async with provider.scoped("https://github.com/acme/repo22.git") as creds:
+        assert creds.token is not None
     assert scoped_requests[-1] == ["repo22"]
 
 
@@ -293,12 +295,13 @@ async def test_github_credentials_before_discovery(
     github_client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
     provider = GitHubFetchCredentialsProvider(github_client)
-    creds = await provider.get("https://github.com/acme/repo22.git")
-    assert creds.token == "ghs_token_22"
+    async with provider.scoped("https://github.com/acme/repo22.git") as creds:
+        assert creds.token == "ghs_token_22"
     # Cached: later lookups must not re-query the API.
     assert github_client.repo_installations["acme/repo22"] == 22
     # Unknown repo (404) degrades to no credentials.
-    assert (await provider.get("https://github.com/acme/nope.git")).token is None
+    async with provider.scoped("https://github.com/acme/nope.git") as creds:
+        assert creds.token is None
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl required")
@@ -876,7 +879,7 @@ async def test_github_check_run_post(github_client: GitHubAppClient) -> None:
     )
 
     await github_client.discover_repos()
-    poster = GitHubCheckRunPoster(github_client, _MemoryCheckRunIds())
+    poster = GitHubCheckRunPoster(github_client)
     await poster.post(
         "acme",
         "repo11",
@@ -885,8 +888,7 @@ async def test_github_check_run_post(github_client: GitHubAppClient) -> None:
         StatusState.success,
         "evaluation succeeded",
         "https://ci.test/repos/acme/repo11/builds/1",
-        project_id=1,
-        build_id=1,
+        external_id="1",
     )
     assert posted == [
         {
@@ -1122,12 +1124,11 @@ async def test_gitlab_register_repo_hook_status_classification(
 # --- credential temp-dir lifecycle ---------------------------------------------
 
 
-async def test_netrc_provider_cleanup_removes_tempdir() -> None:
+async def test_netrc_provider_scope_removes_tempdir() -> None:
     provider = NetrcFetchCredentialsProvider("https://gitea.example.com", "tkn")
-    creds = await provider.get("https://gitea.example.com/a/b.git")
-    assert creds.netrc_file is not None
-    assert creds.netrc_file.exists()
-    provider.cleanup()
+    async with provider.scoped("https://gitea.example.com/a/b.git") as creds:
+        assert creds.netrc_file is not None
+        assert "password tkn" in creds.netrc_file.read_text()
     assert not creds.netrc_file.parent.exists()
 
 

@@ -435,6 +435,38 @@ derivation attribute; effects built without `mkEffect` can set the attribute
 directly. Effects that do not set it get no checkout. If the repository has no
 forge token to push with, the effect fails with an error.
 
+The forge token can push only if the GitHub App installation may write the
+repository's contents. Where it may not, push with a secret of your own instead:
+drop the clone's `url.*.insteadOf` entries, which route every URL on the forge
+through the forge token, and authenticate with the secret.
+
+## Updating flake.lock
+
+effects-lib has hercules-ci-effects' `flakeUpdate`, with the same arguments. Run
+it from a schedule:
+
+```nix
+herculesCI = { primaryRepo, ... }: {
+  onSchedule.flake-update = {
+    when.dayOfWeek = [ "Mon" ];
+    outputs.effects.update = (nixbot.lib.effects { inherit pkgs; }).flakeUpdate {
+      inherit (primaryRepo) forgeType; # github, gitea or gitlab
+      autoMergeMethod = "squash"; # GitHub and Gitea
+    };
+  };
+};
+```
+
+It updates the lock on the `flake-update` branch and opens a pull request to the
+default branch. `baseMergeBranch` and `baseMergeMethod` (merge, rebase,
+fast-forward or reset) bring an existing branch up to date first. It pushes with
+`tokenSecret`, the forge token by default. Name another secret if the forge
+token may not push.
+
+With `perInput = true`, each input gets its own branch and pull request, like
+Dependabot. Runs where an input did not move leave its branch alone, so CI does
+not run again. `excludeInputs` names inputs to skip.
+
 ## Tag pushes
 
 Pushing a tag runs the tagged commit's `onPush` effects with `primaryRepo.tag`
@@ -529,7 +561,7 @@ and similar tools execute code from it. Guard such effects with
 | `pull_request`        | a PR head was built green, also on reopen or label change |
 | `comment`             | a PR comment whose first line is `/command args`          |
 | `pull_request_closed` | a PR was closed or merged                                 |
-| `build_finished`      | any build finished                                        |
+| `build_finished`      | any build finished, and each branch push that shared one  |
 
 Bot comments are ignored, and a `/command` for an effect that is still running
 gets a note instead of a second run. Deliveries are queued in the database and
@@ -547,7 +579,7 @@ and, for the common fields, as `NIXBOT_EVENT_KIND`, `NIXBOT_ACTOR`,
 - `pullRequest`: `number`, `title`, `url`, `author` (shaped like `actor`),
   `baseRef`, `headRef`, `headRev`, `labels`, `draft`, `isFork`, `merged`.
 - `build`: `number`, `url`, `status`, `branch`, `rev`. For `build_finished` it
-  also has `previousStatus` and `failedAttrs`.
+  also has `previousStatus` and `failedAttrs`, and `rev` is the pushed commit.
 - `command`, `args`: for `comment`.
 
 ### Conditions

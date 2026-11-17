@@ -24,7 +24,7 @@ from nixbot.build_scheduler import (
     AttributeStatus,
     BuildOutcome,
 )
-from nixbot.config import BuildPriorityConfig, Config, PriorityRule
+from nixbot.config import BuildPriorityConfig, BuildStoreConfig, Config, PriorityRule
 from nixbot.db import BuildStatus
 from nixbot.db_gen import builds as builds_q
 from nixbot.effects import EffectMeta, EffectsContext
@@ -56,6 +56,7 @@ from .support import (
     git,
     insert_project,
     mk_job,
+    wait_started,
 )
 
 if TYPE_CHECKING:
@@ -128,6 +129,8 @@ class FakeEvalRunner:
 class FakeExecutor:
     outcomes: dict[str, BuildOutcome] = field(default_factory=dict)
     built: list[str] = field(default_factory=list)
+    # The build store each attribute was handed, for per-repo routing.
+    stores: list[BuildStoreConfig | None] = field(default_factory=list)
     # When set, builds wait on this gate (for in-flight tests).
     gate: asyncio.Event | None = None
     started: asyncio.Event = field(default_factory=asyncio.Event)
@@ -144,8 +147,10 @@ class FakeExecutor:
         on_built: Callable[[str], None] | None = None,
         identity: EffectIdentity | None = None,
         stop_queued: asyncio.Event | None = None,
+        store: BuildStoreConfig | None = None,
     ) -> BuildOutcome:
         self.build_keys.append(build_key)
+        self.stores.append(store)
         if on_start is not None and not await on_start():
             return BuildOutcome.cancelled
         self.built.append(job.attr)
@@ -343,6 +348,28 @@ def patch_effects(
         fake.run_effect = run_effect  # type: ignore[method-assign,assignment]
     monkeypatch.setattr("nixbot.orchestrator.default_effects", lambda: fake)
     return fake
+
+
+@pytest.mark.asyncio
+async def test_per_repo_build_store_reaches_the_executor(
+    make_env: EnvFactory, upstream: Path
+) -> None:
+    """A repo listed in build_stores is built in that store."""
+    hub = BuildStoreConfig(url="ssh-ng://nixbot@hub", repos=["acme/hubbed"])
+    default = BuildStoreConfig(url="grpc://farm:50051")
+    executor = FakeExecutor()
+    orchestrator, _, project = await make_env(
+        FakeEvalRunner([mk_job("a")]), executor, name="hubbed"
+    )
+    orchestrator.config.build_store = default
+    orchestrator.config.build_stores = [hub]
+    event = ChangeEvent(
+        repo=project,
+        branch="main",
+        commit_sha=git(upstream, "rev-parse", "HEAD"),
+    )
+    await orchestrator.handle_change_event(event)
+    assert [s.url for s in executor.stores if s] == ["ssh-ng://nixbot@hub"]
 
 
 @pytest.fixture
@@ -1156,7 +1183,7 @@ async def test_cancel_interrupts_evaluation(
             ChangeEvent(repo=project, branch="main", commit_sha=sha)
         )
     )
-    await asyncio.wait_for(eval_runner.started.wait(), timeout=10)
+    await wait_started(eval_runner.started, task)
     for cancel_event in orchestrator.cancel_events.values():
         cancel_event.set()
     build = await asyncio.wait_for(task, timeout=10)
@@ -1197,10 +1224,10 @@ async def test_build_waiting_for_eval_slot_stays_pending(
         )
 
     tasks = [start(projects[0])]
-    await asyncio.wait_for(eval_runner.started.wait(), timeout=10)
+    await wait_started(eval_runner.started, *tasks)
     reporter.started.clear()
     tasks.append(start(projects[1]))
-    await asyncio.wait_for(reporter.started.wait(), timeout=10)
+    await wait_started(reporter.started, *tasks)
     await asyncio.sleep(0.05)
     r1, r2 = await rows()
     assert eval_runner.calls == 1
@@ -1310,7 +1337,7 @@ async def test_pending_attribute_rows_recorded_for_crash_recovery(
             ChangeEvent(repo=project, branch="main", commit_sha=sha)
         )
     )
-    await asyncio.wait_for(executor.started.wait(), timeout=10)
+    await wait_started(executor.started, task)
     rows = await pool.fetch(
         "SELECT a.attr, a.status FROM build_attributes a "
         "JOIN builds b ON a.build_id = b.id WHERE b.project_id = $1",
@@ -1533,7 +1560,7 @@ async def test_inflight_share_fans_out_final_status(
             ChangeEvent(repo=project, branch="main", commit_sha=sha)
         )
     )
-    await asyncio.wait_for(executor.started.wait(), timeout=10)
+    await wait_started(executor.started, task)
     build2 = await orchestrator.handle_change_event(
         ChangeEvent(repo=project, branch="copy", commit_sha=sha)
     )
@@ -1563,7 +1590,7 @@ async def test_stale_event_does_not_supersede_newer_build(
             ChangeEvent(repo=project, branch="main", commit_sha=new_sha)
         )
     )
-    await asyncio.wait_for(executor.started.wait(), timeout=10)
+    await wait_started(executor.started, task)
     stale_build = await orchestrator.handle_change_event(
         ChangeEvent(repo=project, branch="main", commit_sha=old_sha)
     )
@@ -2132,7 +2159,7 @@ async def test_linked_context_reported_on_eval_failure(
             ChangeEvent(repo=project, branch="main", commit_sha=sha)
         )
     )
-    await asyncio.wait_for(eval_runner.started.wait(), timeout=10)
+    await wait_started(eval_runner.started, task)
     build2 = await orchestrator.handle_change_event(
         ChangeEvent(repo=project, branch="lef-copy", commit_sha=sha)
     )
@@ -2794,6 +2821,99 @@ async def test_reuse_for_default_branch_push_runs_effects(
     assert effect_shas == {main_sha}
 
 
+async def build_finished_deliveries(pool: asyncpg.Pool) -> list[dict[str, object]]:
+    rows = await pool.fetch(
+        "SELECT payload FROM work_queue"
+        " WHERE kind = 'deliver' AND payload->>'kind' = 'build_finished'"
+        " ORDER BY id"
+    )
+    return [json.loads(r["payload"]) for r in rows]
+
+
+async def test_push_reusing_pr_build_delivers_build_finished(
+    pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
+) -> None:
+    """A branch push reusing a PR's build gets its own build_finished; a
+    PR reusing a build gets none."""
+    pr_sha = add_commit(upstream, "reuse-finished")
+    orchestrator, _, project = await make_env(
+        FakeEvalRunner([mk_job("a")]), FakeExecutor(), name="reuse-finished"
+    )
+    pr_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=pr_sha, pr_number=9)
+    )
+    assert pr_build is not None
+    [pr_delivery] = await build_finished_deliveries(pool)
+    assert pr_delivery["pr_number"] == 9
+    await pool.execute("DELETE FROM work_queue WHERE kind = 'deliver'")
+
+    git(upstream, "commit", "--allow-empty", "-m", "reuse-finished-merge")
+    main_sha = git(upstream, "rev-parse", "HEAD")
+    main_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=main_sha)
+    )
+    assert main_build is not None
+    assert main_build.id_ == pr_build.id_
+    [main_delivery] = await build_finished_deliveries(pool)
+    assert main_delivery.get("pr_number") is None
+    assert main_delivery["rev"] == main_sha
+    await pool.execute("DELETE FROM work_queue WHERE kind = 'deliver'")
+
+    git(upstream, "commit", "--allow-empty", "-m", "reuse-finished-again")
+    again_sha = git(upstream, "rev-parse", "HEAD")
+    await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=again_sha)
+    )
+    [again_delivery] = await build_finished_deliveries(pool)
+    assert again_delivery["rev"] == again_sha
+    await pool.execute("DELETE FROM work_queue WHERE kind = 'deliver'")
+
+    await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=again_sha, pr_number=10)
+    )
+    assert await build_finished_deliveries(pool) == []
+
+
+async def test_push_linking_running_pr_build_delivers_build_finished(
+    pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
+) -> None:
+    """A branch push that links to a PR's still running build gets its own
+    build_finished when it finishes. A PR linking to it gets none."""
+    pr_sha = add_commit(upstream, "link-running")
+    executor = FakeExecutor(gate=asyncio.Event())
+    orchestrator, _, project = await make_env(
+        FakeEvalRunner([mk_job("a")]), executor, name="link-running"
+    )
+    pr_task = asyncio.create_task(
+        orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=pr_sha, pr_number=9)
+        )
+    )
+    await wait_started(executor.started, pr_task)
+
+    git(upstream, "commit", "--allow-empty", "-m", "link-running-merge")
+    main_sha = git(upstream, "rev-parse", "HEAD")
+    main_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=main_sha)
+    )
+    pr_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=main_sha, pr_number=10)
+    )
+    assert executor.gate is not None
+    executor.gate.set()
+    built = await asyncio.wait_for(pr_task, timeout=10)
+    assert built is not None
+    assert main_build is not None
+    assert pr_build is not None
+    assert main_build.id_ == pr_build.id_ == built.id_
+
+    deliveries = await build_finished_deliveries(pool)
+    assert sorted((d.get("pr_number") or 0, d["rev"]) for d in deliveries) == [
+        (0, main_sha),
+        (9, pr_sha),
+    ]
+
+
 async def tag_deliveries(pool: asyncpg.Pool) -> list[dict[str, object]]:
     rows = await pool.fetch(
         "SELECT payload FROM work_queue"
@@ -2858,7 +2978,7 @@ async def test_tag_attached_to_in_flight_build_delivers_on_success(
             ChangeEvent(repo=project, branch="main", commit_sha=sha)
         )
     )
-    await asyncio.wait_for(executor.started.wait(), timeout=10)
+    await wait_started(executor.started, main)
     await orchestrator.handle_change_event(
         ChangeEvent(repo=project, branch="v1.0", commit_sha=sha, tag="v1.0")
     )
@@ -3824,6 +3944,7 @@ class StoppableExecutor(FakeExecutor):
         on_built: Callable[[str], None] | None = None,
         identity: EffectIdentity | None = None,
         stop_queued: asyncio.Event | None = None,
+        store: BuildStoreConfig | None = None,
     ) -> BuildOutcome:
         if job.attr in self.unslotted and stop_queued is not None:
             await stop_queued.wait()
